@@ -1,0 +1,17 @@
+.git/
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+node_modules/
+frontend/dist/
+dist/
+build/
+*.egg-info/
+jwt_private.pem
+jwt_public.pem

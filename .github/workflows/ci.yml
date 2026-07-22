@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff lint
+        run: ruff check app tests conftest.py
+
+      - name: Ruff format check
+        run: ruff format --check app tests conftest.py
+
+      - name: Mypy strict compile
+        run: mypy app
+
+      - name: Pytest
+        run: pytest
+
+      - name: pip-audit (Blueprint 2.5 A06 / Phase 11 exit criterion)
+        run: |
+          pip-audit -r requirements.txt
+          pip-audit -r requirements-dev.txt
