@@ -1,5 +1,295 @@
 # Merge Log — knowledge-os-best-merged + knowledge-os-final → this build
 
+## Final Blueprint Deliverable + Exit Criteria line-by-line pass
+
+User asked, after the §3.1–3.3 sweep and the healthcheck reconciliation,
+whether every Phase 3 demand and exit criterion was actually met (other
+than local testing). Re-checked line by line against Blueprint Phase
+3's Deliverables and Exit Criteria lists rather than re-asserting the
+earlier summary. Found one more real gap and fixed it; the rest confirm
+as complete.
+
+**Real gap found and fixed:** Deliverable "Redis connection confirmed
+with PING. **Streams and pub/sub channels configured.**" — pub/sub was
+never built. `app/database/redis.py` had `verify_connectivity()`
+(PING) and `ensure_streams()` (Streams), but zero pub/sub setup
+existed anywhere in the codebase, confirmed via a full-codebase grep.
+Fixed:
+- Added `AGENT_STATUS_CHANNEL = "omnirag:agent_status"` to
+  `app/shared/constants.py` (Blueprint 2.7 describes this channel by
+  role — "SSE broadcast channel", "agent_status pub/sub events" — but
+  never names it explicitly the way the ingestion stream is named;
+  this is that missing name).
+- Added `redis.verify_pubsub_ready()` — since Redis pub/sub channels
+  have no server-side "create" concept the way streams do (a channel
+  exists only while something is subscribed), this proves the
+  mechanism works by subscribing, publishing a probe message, and
+  confirming receipt, rather than pretending to "create" something
+  that Redis has no notion of creating ahead of time.
+- **First draft had a real bug the tests caught**: `client.pubsub()`
+  was called before the `try:` block, so a connection failure there
+  was unhandled and the `finally` block would reference an undefined
+  variable. `test_returns_false_and_does_not_raise_on_connection_failure`
+  failed against the first draft, exposing this; fixed by moving
+  `pubsub = client.pubsub()` inside `try`, initialized to `None`
+  beforehand so `finally` can check before using it.
+- Added 4 unit tests (mocked) + 1 integration test (real Redis
+  SUBSCRIBE/PUBLISH round trip).
+
+**Also found and fixed while re-verifying full repository-function
+integration coverage:** `get_source_by_external_id` and
+`get_decision_history` (`app/graph/repository.py`),
+`insert_embedding` and `find_embedding_by_neo4j_node_id`
+(`app/database/mongo_repository.py`) had unit tests but no real-
+service integration test — a gap in the same "unit test AND
+integration test" checklist item already partially fixed in the
+§3.1–3.3 pass, just not completely. Added 6 more integration tests to
+close it. Every repository function across all three repository
+modules now has integration coverage, either direct (function
+imported and called by name in the test) or indirect (exercised
+end-to-end through a route test that calls it internally — confirmed
+by reading routes.py's actual implementation, not assumed).
+
+**Deliverables — final count: 9/9 present.** Repository unit tests:
+confirmed genuinely passing (36/36 repository-specific, 107/107 full
+suite). MongoDB Atlas Vector Search: present via the mongot/Community
+8.2 local equivalent (your explicit decision), not literal Atlas.
+
+**Exit criteria — honest final accounting, not glossed over:**
+- "Neo4j constraints/indexes verified via Neo4j Browser" — code and
+  integration tests exist and are correct; the literal Browser
+  verification step has not happened (no Docker/GUI in this sandbox).
+- "MongoDB Atlas Vector Search index active, verified via Atlas
+  dashboard" — same situation, substituted with a local integration
+  test; no Atlas dashboard exists to check since this runs against
+  mongot locally.
+- "Seed script creates correct data, verified via Neo4j Browser" —
+  same: code and 6 integration tests exist, Browser verification
+  itself hasn't happened.
+- "All repository unit tests passing" — **genuinely done**, verified
+  by actually running pytest, not asserted.
+- "Temporal query test passes" — the test exists, uses Blueprint 2.3's
+  exact query pattern, and is correct; has not been run against a
+  live Neo4j in this sandbox.
+- "Baseline Neo4j query latency logged in Engineering Journal Part
+  5.1" — **still blocked**, unchanged from earlier in this session:
+  the Engineering Journal (DOC-03) has never been provided, so there
+  is nothing to write the baseline into.
+
+Net: every Phase 3 deliverable exists in code with test coverage.
+Every exit criterion that can be satisfied by code+tests is satisfied.
+The four criteria that specifically require a human clicking through
+Neo4j Browser / Atlas dashboard / running `make test-integration`
+against a live daemon remain exactly what the user's own question
+already scoped them as: local testing, not something Claude can
+complete from this sandbox. The Journal baseline is the one item that
+needs either the missing document or the user filling it in directly.
+
+Re-verified after every fix in this pass: `ruff check`/
+`ruff format --check`/`mypy app tests` (strict)/`pip-audit` (both
+requirement files) all clean. `pytest -m "not integration"` —
+**107 passed**, 31 deselected (up from 103/24 before this pass).
+
+## Reconciliation: pre-existing flagged gap, missed in the §3.1–3.3 sweep
+
+User asked directly whether every deviation had actually been listed.
+Re-checking rather than just re-asserting yes surfaced that the
+§3.1–3.3 cross-check above was scoped to *this session's own* changes
+and never reconciled against deviations already logged from **earlier
+sessions** in this same CHANGELOG (the "Update 2/3/4" entries further
+down this file, which predate any Phase 3 work).
+
+One of those earlier entries was a live, correctly-predicted gap that
+this session's own work should have triggered a fix for, and didn't
+until now:
+
+> **Update 3 (pre-Phase 3):** "no `depends_on: condition:
+> service_healthy` / no `healthcheck:` blocks on mongodb/neo4j/redis/
+> ollama. Not urgent *yet*... It will matter the moment Phase 3 adds
+> real `neo4j`/`motor`/`redis-py` clients that connect at startup."
+
+Phase 3 did exactly that — added real `neo4j`, `motor`, `redis-py`
+clients wired into the app's `lifespan` — and the healthcheck gap was
+never closed. `docker-compose.yml`'s `omnirag-api` `depends_on` was
+still a plain list (no `condition:`) until this reconciliation, meaning
+the API container could start and immediately fail its first
+connection attempt before Neo4j/Redis finished booting (Neo4j in
+particular is slow to accept Bolt connections after container start,
+per that same earlier entry).
+
+**Fixed now:**
+- `neo4j` service — added a `cypher-shell -u ... -p ... 'RETURN 1'`
+  healthcheck (`CMD-SHELL`, 30 retries, 20s start_period — Neo4j 4.4
+  boot is slow). Pattern confirmed against multiple independent public
+  docker-compose examples using neo4j:4.4/5.x images, not invented.
+- `redis` service — added a `redis-cli ping` healthcheck.
+- `omnirag-api`'s `depends_on` — upgraded from a plain service-name
+  list to explicit `condition:` blocks: `service_healthy` for
+  mongodb/neo4j/redis (all three now have real healthchecks and all
+  three have real Python clients connecting at startup), `service_started`
+  for mongot and ollama (neither has a simple documented CLI healthcheck,
+  and neither has Phase 3 code connecting to it yet — ollama is Phase 5,
+  mongot's vector search is unused until Phase 7).
+
+Re-verified after this fix: `ruff check`/`mypy app tests` (strict)/
+`pytest -m "not integration"` (**103 passed**, unchanged — this was a
+YAML-only fix, no Python touched) all still clean.
+
+**Lesson stated plainly, not glossed over:** asked to re-verify my own
+"did you list every deviation" claim, the honest answer was no on
+first check — this CHANGELOG has audit history from multiple sessions
+and I had only re-surfaced the current session's findings, not
+reconciled against what was already flagged and still open. Fixed by
+actually reading back through the file rather than re-asserting the
+same summary.
+
+## Blueprint §3.1–3.3 Cross-Check (this session)
+
+User asked for a thorough line-by-line cross-check of all Phase 3 work
+against Blueprint §3.1 (Folder Structure), §3.2 (Coding Standards),
+§3.3 (Git Workflow) and the Industrial Vibe Coding Rules — not a
+re-summary, an actual re-verification. Findings:
+
+**Real bugs found and fixed:**
+- **Cypher property-injection vulnerability (real, exploitable)** —
+  `app/graph/repository.py`'s `get_node_by_label_and_key()` interpolated
+  `key_property` directly into a Cypher query with zero validation.
+  `key_property` is fed straight from `GET /graph/node/{id}`'s
+  free-text `?key_property=` query parameter (`app/graph/routes.py`) —
+  an external caller could send e.g. `?key_property=name}) DETACH
+  DELETE (n {x` to break out of the intended property-match clause.
+  Fixed: derived an allowlist of valid property names per label from
+  each Pydantic model's real fields (`_VALID_KEY_PROPERTIES_BY_LABEL`,
+  built via `get_type_hints()` so it can't silently drift from
+  `app/graph/models.py`), validated `key_property` against it before
+  any Cypher runs, and wired the route to translate the rejection into
+  a proper `400 VALIDATION_ERROR` (was previously going to be an
+  unhandled 500). Added 3 regression tests including an adversarial
+  injection-payload test, then **mutation-tested the fix** — reverted
+  the validation, confirmed both tests failed correctly, restored —
+  to prove the tests actually catch the vulnerability rather than
+  passing trivially.
+- **Rule R-34 violation (magic numbers)** — `384` (embedding
+  dimensions) and `"all-MiniLM-L6-v2"` (embedding model name) were
+  hardcoded directly in `app/database/mongodb.py` and
+  `app/database/mongo_repository.py` instead of centralized named
+  constants, despite Blueprint 8.2/Rule R-101 explicitly treating the
+  embedding model as locked, migration-only infrastructure — exactly
+  the kind of value R-34 exists to centralize. Fixed: added
+  `EMBEDDING_MODEL_NAME`/`EMBEDDING_DIMENSIONS` to
+  `app/shared/constants.py`, updated both source files and their tests
+  to reference the constants instead of repeating literals.
+- **PR-checklist-ambiguous Cypher string concatenation** —
+  `get_decision_history()` used `+` to conditionally assemble a
+  `WHERE` clause fragment. Every actual *value* stayed a bound
+  `$status` parameter (the real R-54 safety property), so this was
+  never exploitable — but it still literally matched Blueprint 3.3's
+  PR checklist item "No Cypher string concatenation anywhere — grep
+  for string interpolation in Cypher queries", which is written to be
+  checkable by grep. Rewrote as two fixed literal query strings
+  (branching in Python, not string-building) so a future grep-based
+  check never has to manually re-clear this as a false positive.
+- **Stale/inaccurate docstring** — `app/database/neo4j.py` claimed
+  callers could import a `get_session()` helper from it; no such
+  function was ever implemented or called anywhere in the codebase.
+  Fixed the docstring to describe the actual pattern (`async with
+  driver.session()` opened per call, no singleton session).
+- **Missing integration tests (PR checklist item 5)** —
+  `app/entity_resolution/repository.py` and
+  `app/database/mongo_repository.py` had unit tests only, no real-
+  service integration test, violating the PR checklist's "New feature
+  has unit test AND at least one integration test." Added
+  `TestEntityResolutionRepositoryAgainstRealServer` (3 tests) and
+  `TestMongoRepositoryAgainstRealServer` (3 tests) to
+  `tests/test_phase3_integration.py`.
+
+**Contract deviation found, surfaced to user, resolved explicitly (not
+silently):**
+- `GET /graph/node/{id}` requires a `type` query param even though
+  Blueprint 2.4 states `Request: None` for this endpoint. Neo4j has no
+  single global node-ID space spanning labels the way a relational PK
+  would; the alternatives (Neo4j `elementId()` as the public ID, or
+  searching all 6 labels per lookup) both had worse tradeoffs. User
+  confirmed keeping `type` as required — see Decision Log below and
+  the `get_node` docstring in `app/graph/routes.py`.
+
+**Confirmed clean (no issues found):** naming conventions (snake_case
+files/functions, PascalCase Pydantic models, UPPER_SNAKE_CASE
+constants) across every Phase 3 file; no bare/silent exception
+swallowing (`except Exception:` blocks all log with `exc_info=True` and
+return a typed `False`, never a silent pass); no module-level side
+effects (AST-checked every new file for calls at import time — zero
+found); no circular imports (imported every new module together in one
+process, including `app.main`, with zero errors); mypy `--strict`
+clean across all 81 source files; R-48 repository layering holds (no
+repository imports another repository, no business-logic/threshold
+logic found in any repository function).
+
+**Not fully checked:** §3.3's branch-naming and commit-message-format
+rules — this is an extracted zip, not a git clone, so there's no
+commit history or branch list to check against R-72's `type/description`
+convention. That part of §3.3 can only be verified once this is
+actually committed to your repo.
+
+Full suite re-verified after every fix in this cross-check:
+`ruff check`/`ruff format --check`/`mypy app tests` (strict) all clean.
+`pytest -m "not integration"` — **103 passed**, 24 deselected (up from
+99/18 before this session — the new integration tests and the
+decision-history no-status-branch test). `pip-audit` clean.
+
+## Phase 3 — Database Layer (COMPLETE as of this entry)
+
+Covers every Blueprint Phase 3 deliverable and exit criterion, across
+two sessions (DB connections/health → schema/seed/streams →
+repositories/routes → MongoDB 8.2 local vector search). Status against
+the blueprint's own checklist:
+
+| Deliverable | Status |
+|---|---|
+| Neo4j driver/session singleton + real `/health` checks | Done |
+| MongoDB (Motor) client singleton + `raw_events`/`embeddings`/`generated_documents` collection getters | Done |
+| Redis client singleton + real `/health` check | Done |
+| Neo4j schema: 1 uniqueness constraint, 9 indexes, 1 fulltext index (Blueprint 2.3 table, verified against real Neo4j 4.4 docs) | Done |
+| MongoDB Atlas Vector Search index | Done, upgraded scope — see Decision Log below |
+| Redis Streams consumer group + dead-letter stream (idempotent `ensure_streams()`) | Done |
+| Seed script — 3 Concept/3 Entity/2 Decision/5 Source nodes + `DECIDED`/`AUTHORED`/`CAUSED` relationships | Done |
+| Repository modules — Neo4j (`app/graph/repository.py`, `app/entity_resolution/repository.py`) | Done |
+| Repository modules — MongoDB (`app/database/mongo_repository.py`) | Done |
+| `GET /workspace/status`, `GET /graph/nodes`, `GET /graph/node/{id}` wired to real Neo4j queries | Done — **not yet auth/rate-limited, see routes.py docstring; Phase 4 dependency** |
+| Integration tests against real Neo4j/MongoDB/Redis (18 tests) | Written and collect correctly; **not run in this sandbox (no Docker available) — run `make test-integration` locally before fully trusting** |
+| Repository unit tests (mocked drivers, Stage 1 CI) | Done — 99 unit tests total, all passing |
+| Temporal query test (past-timestamp graph state) | Done, both unit-mocked and real-service versions |
+| Baseline Neo4j query latency logged in Engineering Journal Part 5.1 | **Not done — Engineering Journal (DOC-03) was never provided to Claude; this cannot be filled in without that document. Run the `make test-integration` timing output through Journal 5.1 yourself, or share the doc.** |
+
+### Decision Log additions (Rule R-60/CR-03 — log every decision the same session)
+
+| Decision | Chosen | Rejected | Reason |
+|---|---|---|---|
+| Neo4j Python driver version | `neo4j==5.28.4` | `neo4j==6.x` (latest) | Locked server image is `neo4j:4.4`; Neo4j's driver-server compatibility matrix only guarantees 4.4 server with {4.3, 4.4, 5.x} drivers, not 6.x. Verified directly against Neo4j's compatibility docs, not assumed. |
+| MongoDB Vector Search (local dev) | Upgrade `mongo:7` → `mongodb/mongodb-community-server:8.2-ubi8-slim` + `mongodb/mongodb-community-search:0.64.0` (mongot sidecar), replica-set mode | Stay on Atlas-only (Blueprint 2.2's original lock), or defer to Phase 7 | MongoDB Community Edition 8.2+ added local `$vectorSearch` (Sept 2025 GA) — no Atlas account needed for local dev. User explicitly chose to upgrade now rather than defer. Confirmed exact image tags directly against Docker Hub (`mongodb/mongodb-community-server`, `mongodb/mongodb-community-search`), not a third-party blog's claim alone. |
+| CI integration-tests job database images | Kept plain `mongo:7` in GitHub Actions `services:` (no mongot sidecar in CI) | Rearchitect CI to manually `docker run` a dependent mongot sidecar | GitHub Actions `services:` containers can't express `depends_on`/custom startup ordering the way docker-compose can. Vector search is unused by any code until Phase 7 (retrieval); reworking CI's whole container orchestration for a capability nothing calls yet was not worth it now. `TestMongoVectorSearchIndexAgainstRealServer` (tests/test_phase3_integration.py) skips gracefully when mongot isn't reachable, so it only actually runs via local `make test-integration` against the full docker-compose stack. Revisit when Phase 7 needs CI coverage of real vector search. |
+| `GET /workspace/status`, `/graph/nodes`, `/graph/node/{id}` — build now or wait for Phase 4 auth | Build the data-layer logic now, unauthenticated; flag clearly as unsafe to expose until Phase 4 | Wait for Phase 4 (JWT middleware, rate limiting) to exist first | `app/graph/routes.py`'s own pre-existing docstring already committed to "Implemented in Phase 3" for these three routes specifically. Rule R-70 (data model → repository → service → API → consumer, in order) supports building the data layer now and layering auth on top later via `Depends()`, rather than blocking Phase 3 on Phase 4 not existing yet. |
+| `GET /graph/node/{id}` — Blueprint 2.4 says `Request: None`, but Neo4j has no single global node-ID space across labels | Kept `type` as a required query param (`?type=Concept`) | (a) Neo4j `elementId()` as node_id — matches contract literally but leaks an unstable internal identifier into the public API; (b) search all 6 labels for a match — matches contract but 6x slower and ambiguous on key collisions | User explicitly chose to keep human-readable, unambiguous IDs over literal contract compliance. Documented as a flagged deviation in `app/graph/routes.py`'s `get_node` docstring, not silently built around (Rule R-68). |
+
+### Files changed this Phase 3 close-out pass (repositories/routes/vector search)
+
+- `app/graph/models.py` — new. Typed Pydantic domain models (ConceptNode, EntityNode, DecisionNode, SourceNode, QuestionNode, ContradictionNode, + relationship types) transcribed directly from Blueprint 2.3's property tables.
+- `app/graph/repository.py` — real implementation (was a 1-line stub). Node counts, last-ingested lookup, unanswered-question count, paginated node listing, node-by-key lookup, Source dedup lookup, decision history with decider join.
+- `app/entity_resolution/repository.py` — real implementation (was a 1-line stub). Candidate pool listing for Stage 1, shared-neighbor-count for Stage 3, `ALIAS_OF` merge write.
+- `app/database/mongo_repository.py` — new. Typed CRUD for `raw_events`, `embeddings`, `generated_documents` — the cross-cutting MongoDB repository Blueprint Phase 3 calls for.
+- `app/database/mongodb.py` — added `ensure_vector_search_index()` and `list_search_indexes()`.
+- `app/graph/routes.py` — `GET /workspace/status`, `GET /graph/nodes`, `GET /graph/node/{id}` now call real repository functions instead of raising `EndpointNotImplementedError`.
+- `docker-compose.yml` — `mongodb` service upgraded to `mongodb/mongodb-community-server:8.2-ubi8-slim` (replica-set mode), new `mongot` sidecar service, new `mongot_data` volume.
+- `.env.example` — `MONGODB_URI` updated for replica-set connection (`?replicaSet=rs0&directConnection=true`).
+- `pyproject.toml` — added `flake8-bugbear` `extend-immutable-calls` for `fastapi.Query`/`Depends`/`Path`/`Body` (fixes a real false-positive B008 lint error on every FastAPI route using these, not just this session's routes).
+- `app/test_health.py` — updated the Phase 2 stub-endpoint regression test to remove the 3 now-real routes from the generic 501 list; added dedicated tests for their real (mocked-repository) behavior.
+- `tests/test_phase3_integration.py` — added `TestGraphRoutesAgainstRealServer` (4 tests) and `TestMongoVectorSearchIndexAgainstRealServer` (1 test, skips gracefully without mongot).
+- New unit test files: `app/graph/test_repository.py` (13 tests), `app/entity_resolution/test_repository.py` (5 tests), `app/database/test_mongo_repository.py` (13 tests, 4 of them vector-search-specific).
+
+**Verified this pass**: `ruff check`/`ruff format --check`/`mypy app tests` (strict) all clean. `pytest -m "not integration"` — **99 passed**, 18 deselected. `pip-audit` clean on both requirement files. Mutation-tested two assertions by deliberately breaking the code under test and confirming the test failed, then restored (Rule R-66). Did **not** run the 18 integration tests against real services — no Docker in this sandbox; run `make test-integration` locally to get the real proof, especially for the new MongoDB 8.2/mongot vector search path which is the newest and least-trodden piece.
+
+## Merge Log — knowledge-os-best-merged + knowledge-os-final → this build
+
 Base: `knowledge-os-final`. Reason: lazy `get_settings()` pattern
 (no module-level side effects on `import app.config`), typed
 per-endpoint response models matching Blueprint 2.4 exactly (not a

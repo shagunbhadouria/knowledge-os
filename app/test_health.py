@@ -5,19 +5,19 @@ from fastapi.testclient import TestClient
 
 from app.main import create_app
 
-# (method, path, json_body) for all 18 locked endpoints (Blueprint 2.4).
-# /health is excluded — it is real Phase 2 behavior, not a 501 stub.
+# (method, path, json_body) for the remaining stub endpoints (Blueprint
+# 2.4). /health is excluded (real Phase 2 behavior). GET /workspace/status,
+# GET /graph/nodes, and GET /graph/node/{id} are excluded as of Phase 3 --
+# they now call real Neo4j queries (see the dedicated tests below) and
+# are no longer 501 stubs.
 _STUB_ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
     ("post", "/api/v1/auth/google", {"code": "abc"}),
     ("post", "/api/v1/auth/refresh", {"refresh_token": "abc"}),
-    ("get", "/api/v1/workspace/status", None),
     ("post", "/api/v1/ingest/github/webhook", {}),
     ("post", "/api/v1/ingest/slack/webhook", {}),
     ("post", "/api/v1/ingest/files", None),
     ("get", "/api/v1/ingest/status/evt-1", None),
     ("post", "/api/v1/query", {"question": "why?"}),
-    ("get", "/api/v1/graph/nodes", None),
-    ("get", "/api/v1/graph/node/node-1", None),
     ("get", "/api/v1/graph/history", None),
     ("get", "/api/v1/graph/drift/postgresql", None),
     ("get", "/api/v1/experts/authentication", None),
@@ -31,12 +31,24 @@ def _client() -> TestClient:
     return TestClient(create_app(), raise_server_exceptions=False)
 
 
-def test_health_returns_starting_status_with_service_map() -> None:
+def test_health_returns_degraded_status_with_service_map() -> None:
+    # Phase 3: mongodb/neo4j/redis now run real connectivity checks
+    # (Rule R-89). No real database is reachable in this unit-test
+    # process (conftest.py points at localhost URIs nothing is
+    # listening on), so each reports "unhealthy" honestly rather than
+    # a faked "healthy" -- and ollama, which has no client wired until
+    # Phase 5, still reports "starting". Overall status is "degraded"
+    # per app/shared/health.py's aggregation rule: any "unhealthy"
+    # service means the whole system is degraded, not "starting".
     response = _client().get("/api/v1/health")
 
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == "starting"
+    assert body["status"] == "degraded"
+    assert body["services"]["mongodb"] == "unhealthy"
+    assert body["services"]["neo4j"] == "unhealthy"
+    assert body["services"]["redis"] == "unhealthy"
+    assert body["services"]["ollama"] == "starting"
     assert set(body["services"]) == {"mongodb", "neo4j", "redis", "ollama"}
 
 
@@ -129,9 +141,11 @@ def test_every_stub_endpoint_returns_standard_501_envelope(
 
 
 def test_all_18_endpoints_are_accounted_for() -> None:
-    # +1 for /health, +1 for /query/stream (SSE, tested separately —
-    # TestClient does not stream, see test below).
-    assert len(_STUB_ENDPOINTS) + 2 == 18
+    # +1 for /health, +1 for /query/stream (SSE, tested separately --
+    # TestClient does not stream, see test below), +3 for the routes
+    # Phase 3 made real (workspace/status, graph/nodes, graph/node/{id},
+    # tested directly below rather than via the generic 501 stub list).
+    assert len(_STUB_ENDPOINTS) + 2 + 3 == 18
 
 
 def test_missing_required_field_returns_400_validation_error_with_field_name() -> None:
@@ -152,3 +166,130 @@ def test_query_stream_route_exists_and_is_wired() -> None:
     response = _client().get("/api/v1/query/stream", params={"question": "why?"})
 
     assert response.status_code == 501
+
+
+def test_workspace_status_calls_repository_and_shapes_the_response() -> None:
+    # Phase 3: GET /workspace/status is real now. Repository calls are
+    # mocked here (no live Neo4j in this unit-test process) - the
+    # real-service proof is tests/test_phase3_integration_seed_and_graph.py.
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock, patch
+
+    from app.graph import repository
+
+    with (
+        patch.object(
+            repository,
+            "get_node_counts_by_label",
+            new=AsyncMock(
+                return_value={"Entity": 3, "Decision": 2, "Source": 5, "Concept": 3}
+            ),
+        ),
+        patch.object(
+            repository,
+            "get_last_ingested_at",
+            new=AsyncMock(return_value=datetime(2025, 7, 1, tzinfo=UTC)),
+        ),
+        patch.object(
+            repository, "get_unanswered_question_count", new=AsyncMock(return_value=2)
+        ),
+    ):
+        response = _client().get("/api/v1/workspace/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["entity_count"] == 3
+    assert body["decision_count"] == 2
+    assert body["source_count"] == 5
+    assert body["gap_count"] == 2
+    assert body["last_ingested_at"] == "2025-07-01T00:00:00+00:00"
+
+
+def test_workspace_status_reports_null_last_ingested_when_graph_is_empty() -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from app.graph import repository
+
+    with (
+        patch.object(
+            repository,
+            "get_node_counts_by_label",
+            new=AsyncMock(return_value={}),
+        ),
+        patch.object(
+            repository, "get_last_ingested_at", new=AsyncMock(return_value=None)
+        ),
+        patch.object(
+            repository, "get_unanswered_question_count", new=AsyncMock(return_value=0)
+        ),
+    ):
+        response = _client().get("/api/v1/workspace/status")
+
+    assert response.status_code == 200
+    assert response.json()["last_ingested_at"] is None
+
+
+def test_list_nodes_requires_the_type_query_parameter() -> None:
+    # Blueprint 2.4 locks ?type=Concept as required - omitting it must
+    # be a 400 VALIDATION_ERROR, not a 500 or a silently-empty list.
+    response = _client().get("/api/v1/graph/nodes")
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_list_nodes_returns_nodes_and_total_for_a_valid_type() -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from app.graph import repository
+
+    with patch.object(
+        repository,
+        "list_nodes_by_label",
+        new=AsyncMock(return_value=([{"name": "PostgreSQL"}], 1)),
+    ):
+        response = _client().get("/api/v1/graph/nodes", params={"type": "Concept"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert body["nodes"][0]["type"] == "Concept"
+    assert body["nodes"][0]["properties"] == {"name": "PostgreSQL"}
+
+
+def test_get_node_returns_404_when_repository_finds_nothing() -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from app.graph import repository
+
+    with patch.object(
+        repository, "get_node_by_label_and_key", new=AsyncMock(return_value=None)
+    ):
+        response = _client().get(
+            "/api/v1/graph/node/DoesNotExist", params={"type": "Concept"}
+        )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_get_node_returns_node_detail_when_found() -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from app.graph import repository
+
+    with patch.object(
+        repository,
+        "get_node_by_label_and_key",
+        new=AsyncMock(return_value={"name": "PostgreSQL", "confidence_score": 0.9}),
+    ):
+        response = _client().get(
+            "/api/v1/graph/node/PostgreSQL", params={"type": "Concept"}
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["node"]["properties"]["name"] == "PostgreSQL"
+    assert body["relationships"] == []
+    assert body["sources"] == []
+    assert body["confidence_breakdown"] == {}

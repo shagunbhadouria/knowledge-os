@@ -6,6 +6,21 @@ src = ["app"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "ASYNC"]
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection pattern requires Query()/Depends()/
+# Path()/Body() as literal argument defaults -- that is how FastAPI
+# discovers parameter metadata at route registration time, not a
+# mutable-default-argument bug B008 exists to catch. Without this,
+# every route using Query()/Depends() needs a per-line noqa, which
+# just hides the same false positive redundantly at every call site
+# instead of declaring it once here.
+extend-immutable-calls = [
+    "fastapi.Query",
+    "fastapi.Depends",
+    "fastapi.Path",
+    "fastapi.Body",
+]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
@@ -23,3 +38,6 @@ testpaths = ["app", "tests"]
 python_files = ["test_*.py"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: requires real MongoDB/Neo4j/Redis (Docker Compose or CI service containers), not run by default",
+]

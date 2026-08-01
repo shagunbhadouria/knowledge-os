@@ -6,3 +6,14 @@ pydantic==2.10.4
 pydantic-settings==2.7.1
 structlog==24.4.0
 python-multipart==0.0.32
+
+# Database drivers — Phase 3 (Blueprint 2.2 / 3.1)
+# neo4j pinned to the 5.x line, NOT 6.x: the locked server image is
+# neo4j:4.4 (Blueprint 5.1/Phase 1), and Neo4j's driver-server
+# compatibility matrix only guarantees 4.4 server <-> {4.3, 4.4, 5.x}
+# drivers — 6.x drivers target the 6.x server series and are not on
+# that matrix. Upgrading to a 6.x driver requires upgrading the server
+# image first; that is a Blueprint 2.2 stack change, not a Phase 3 one.
+neo4j==5.28.4
+motor==3.7.1
+redis==5.3.1
