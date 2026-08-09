@@ -38,3 +38,35 @@ _TEST_ENV: dict[str, str] = {
 
 for _key, _value in _TEST_ENV.items():
     os.environ.setdefault(_key, _value)
+
+# Rule R-51/R-36 note: docker-compose.yml injects real MONGODB_URI
+# into every omnirag-api container as an environment variable —
+# including when pytest runs inside that same container.
+# os.environ.setdefault() above is a no-op for keys that already
+# exist, so the real MONGODB_URI (pointed at the live seeded
+# `omnirag` database) was silently winning over the test-isolated
+# `omnirag_test` database this file intends every test to use.
+#
+# The fix must only swap the *database name*, not the whole URI.
+# Force-overriding the entire string back to
+# "mongodb://localhost:27017/omnirag_test" (as an earlier version of
+# this file did) throws away whatever host docker-compose.yml already
+# set (the "mongodb" Docker-network service name) and silently
+# reverts it to "localhost" - which only resolves to anything when
+# pytest runs on the bare host, not inside the omnirag-api container
+# itself. That breaks every MongoDB-touching integration test with
+# ServerSelectionTimeoutError/ConnectionRefused the first time pytest
+# actually runs where it's meant to run: inside the container, against
+# mongodb-atlas-local. NEO4J_PASSWORD is deliberately NOT overridden at
+# all, for the same host-preservation reason: these integration/health
+# tests connect to the real Neo4j container, which uses the real
+# docker-compose password, not a placeholder.
+_existing_mongo_uri = os.environ["MONGODB_URI"]
+if "/omnirag_test" not in _existing_mongo_uri:
+    # Swap only the trailing "/omnirag" (or whatever default db name
+    # is present) for "/omnirag_test", preserving host, port, and any
+    # query string (e.g. ?directConnection=true) exactly as set.
+    _base, _, _rest = _existing_mongo_uri.rpartition("/")
+    _db_name, _, _query = _rest.partition("?")
+    _new_rest = "omnirag_test" + ("?" + _query if _query else "")
+    os.environ["MONGODB_URI"] = f"{_base}/{_new_rest}"

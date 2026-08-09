@@ -104,14 +104,42 @@ DECISIONS: list[dict[str, Any]] = [
         "valid_until": None,
     },
     {
+        # DEVIATION NOTE (logged per Rule R-68): Blueprint Phase 3's
+        # literal deliverable says "2 Decision nodes" — this seed now
+        # has 3, because a reversal is the original Decision updated
+        # in place (status -> superseded, valid_until set) plus one
+        # new Decision node created at the reversal point, linked by
+        # SUPERSEDES — +1 node, not a duplicate. Without this the
+        # valid_from/valid_until reversal logic Blueprint 2.3 calls
+        # "the most common mistake" in the whole schema had zero
+        # live-data test coverage — only mocked unit tests exercised
+        # it. This decision is the one that gets reversed at _T2
+        # below; see its status/valid_until there.
         "statement": "Use JWT for auth instead of session cookies",
         "decided_at": _T0.isoformat(),
         "decided_by": "Arjun Mehta",
         "source_url": "https://github.com/example/omnirag/pull/12",
+        "status": "superseded",
+        "reversed_at": _T2.isoformat(),
+        "superseded_by": "Require Google OAuth 2.0 for all authentication",
+        "valid_from": _T0.isoformat(),
+        "valid_until": _T2.isoformat(),
+    },
+    {
+        # The new Decision created at the reversal point. Its
+        # valid_from is exactly the old Decision's valid_until — no
+        # gap, no overlap — matching Blueprint 2.3's temporal validity
+        # rule verbatim: "set valid_until on the existing Decision node
+        # to the reversal timestamp... create a new Decision node with
+        # valid_from at the reversal timestamp."
+        "statement": "Require Google OAuth 2.0 for all authentication",
+        "decided_at": _T2.isoformat(),
+        "decided_by": "Arjun Mehta",
+        "source_url": "https://github.com/example/omnirag/pull/203",
         "status": "active",
         "reversed_at": None,
         "superseded_by": None,
-        "valid_from": _T0.isoformat(),
+        "valid_from": _T2.isoformat(),
         "valid_until": None,
     },
 ]

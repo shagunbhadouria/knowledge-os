@@ -106,12 +106,22 @@ class TestMongoDBSingleton:
     async def test_verify_connectivity_returns_false_on_connection_failure(
         self,
     ) -> None:
-        client = mongodb.get_client()
-        with patch.object(
-            client.admin,
-            "command",
-            new=AsyncMock(side_effect=OSError("connection refused")),
-        ):
+        # NOTE: patching client.admin.command directly does not work
+        # here - Motor's `.admin` is a property that constructs a new
+        # AsyncIOMotorDatabase wrapper on every access, so the object
+        # this test patches is not the same object
+        # verify_connectivity()'s own get_client().admin.command call
+        # sees. The mock never engages and the assertion silently
+        # passes the wrong way (True instead of False). Patching
+        # get_client() itself sidesteps that: every access to
+        # mock_client.admin returns the *same* MagicMock, so its
+        # .command is stable to patch.
+        from unittest.mock import MagicMock
+
+        mock_client = MagicMock()
+        mock_client.admin.command = AsyncMock(side_effect=OSError("connection refused"))
+
+        with patch.object(mongodb, "get_client", return_value=mock_client):
             result = await mongodb.verify_connectivity()
 
         assert result is False

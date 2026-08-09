@@ -37,7 +37,25 @@ warn_required_dynamic_aliases = true
 testpaths = ["app", "tests"]
 python_files = ["test_*.py"]
 asyncio_mode = "auto"
-asyncio_default_fixture_loop_scope = "function"
+# "function" scope gives every test its own event loop, but
+# app/database/neo4j.py, mongodb.py, and redis.py all cache their
+# driver/client as a process-lifetime module-level singleton (by
+# design - Rule R-48, one connection pool per process). The first
+# test to call get_driver()/get_client() binds that singleton's
+# internal sockets/tasks to its event loop; when that test's loop
+# closes, every later test hits "RuntimeError: Event loop is closed"
+# or a pending-task error from _async_fixture_wrapper. "session"
+# scope keeps one event loop for the whole run, matching the
+# singletons' actual lifetime.
+asyncio_default_fixture_loop_scope = "session"
+# pytest-asyncio 1.4.0 tracks the fixture loop scope and the test loop
+# scope as two separate ini options - setting only
+# asyncio_default_fixture_loop_scope above left every *test* still on
+# its own "function"-scoped loop while fixtures now shared one
+# session-scoped loop, which made the mismatch worse (28 failures)
+# instead of fixing it. Both must be "session" together so a test and
+# the fixtures it depends on run on the same loop.
+asyncio_default_test_loop_scope = "session"
 markers = [
     "integration: requires real MongoDB/Neo4j/Redis (Docker Compose or CI service containers), not run by default",
 ]

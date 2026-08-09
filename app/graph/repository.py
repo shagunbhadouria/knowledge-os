@@ -149,7 +149,7 @@ async def list_nodes_by_label(
             limit=limit,
         )
         records = await result.data()
-        nodes = [_record_properties(r, "n") for r in records]
+        nodes = [_coerce_neo4j_datetimes(_record_properties(r, "n")) for r in records]
 
         count_result = await session.run(f"MATCH (n:{label}) RETURN count(n) AS c")
         count_record = await count_result.single()
@@ -199,7 +199,7 @@ async def get_node_by_label_and_key(
         record = await result.single()
         if record is None:
             return None
-        return _record_properties(record, "n")
+        return _coerce_neo4j_datetimes(_record_properties(record, "n"))
 
 
 async def get_source_by_external_id(

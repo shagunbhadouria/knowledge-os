@@ -99,6 +99,26 @@ SET r.established_at = d.valid_from,
     r.confidence = 0.85
 """
 
+# Reversal link: which new Decision supersedes which old one. Mirrors
+# _CAUSAL_LINKS' shape deliberately - same pattern, same MERGE style,
+# so this isn't a new concept in the file, just the missing half of
+# temporal reversal (Blueprint 2.3: "create a new Decision node...
+# and a SUPERSEDES relationship pointing to the old node").
+_SUPERSEDES_LINKS: list[tuple[str, str]] = [
+    (
+        "Require Google OAuth 2.0 for all authentication",
+        "Use JWT for auth instead of session cookies",
+    ),
+]
+
+_MERGE_SUPERSEDES = """
+MATCH (new:Decision {statement: $new_statement})
+MATCH (old:Decision {statement: $old_statement})
+MERGE (new)-[r:SUPERSEDES]->(old)
+SET r.superseded_at = old.valid_until,
+    r.reason = "Reversal seeded for Phase 3 temporal validity testing"
+"""
+
 
 async def run_seed(driver: AsyncDriver | None = None) -> None:
     """Apply schema, then write the fixed seed dataset. Idempotent end
@@ -134,6 +154,14 @@ async def run_seed(driver: AsyncDriver | None = None) -> None:
                 _MERGE_CAUSED, statement=statement, concept_name=concept_name
             )
         logger.info("seed.causal_links_written", count=len(_CAUSAL_LINKS))
+
+        for new_statement, old_statement in _SUPERSEDES_LINKS:
+            await session.run(
+                _MERGE_SUPERSEDES,
+                new_statement=new_statement,
+                old_statement=old_statement,
+            )
+        logger.info("seed.supersedes_links_written", count=len(_SUPERSEDES_LINKS))
 
     logger.info(
         "seed.complete",

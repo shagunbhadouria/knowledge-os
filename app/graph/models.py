@@ -37,7 +37,7 @@ class ConceptNode(BaseModel):
     name: str
     aliases: list[str]
     valid_from: datetime
-    valid_until: datetime | None
+    valid_until: datetime | None = None
     confidence_score: float
     source_count: int
     contradiction_count: int
@@ -64,10 +64,10 @@ class DecisionNode(BaseModel):
     decided_by: str
     source_url: str
     status: Literal["active", "reversed", "superseded"]
-    reversed_at: datetime | None
-    superseded_by: str | None
+    reversed_at: datetime | None = None
+    superseded_by: str | None = None
     valid_from: datetime
-    valid_until: datetime | None
+    valid_until: datetime | None = None
 
 
 class SourceNode(BaseModel):
@@ -76,7 +76,7 @@ class SourceNode(BaseModel):
 
     source_type: Literal["github", "slack", "file"]
     external_id: str
-    url: str | None
+    url: str | None = None
     author_id: str
     content_preview: str
     ingested_at: datetime
@@ -96,7 +96,7 @@ class QuestionNode(BaseModel):
     asked_by: str
     asked_at: datetime
     answered: bool
-    answer_source_id: str | None
+    answer_source_id: str | None = None
     ask_count: int
 
 
@@ -108,7 +108,7 @@ class ContradictionNode(BaseModel):
     description: str
     detected_at: datetime
     resolved: bool
-    resolution_notes: str | None
+    resolution_notes: str | None = None
 
 
 class CausedRelationship(BaseModel):

@@ -26,8 +26,17 @@ class TestSeedData:
     def test_exactly_three_entities(self) -> None:
         assert len(ENTITIES) == 3
 
-    def test_exactly_two_decisions(self) -> None:
-        assert len(DECISIONS) == 2
+    def test_exactly_three_decisions_one_reversed(self) -> None:
+        # Blueprint Phase 3 literally says "2 Decision nodes" - this
+        # is 3 because a reversal (Blueprint 2.3's temporal validity
+        # rule) requires the original Decision to be updated in place
+        # (status -> superseded, valid_until set) plus one brand new
+        # Decision node created at the reversal point, linked by
+        # SUPERSEDES. That's +1 node versus the original 2, not +2 -
+        # the reversed Decision is the same node, not a duplicate.
+        # Without this the reversal logic had zero live-data coverage.
+        # See the deviation note on the DECISIONS list itself.
+        assert len(DECISIONS) == 3
 
     def test_exactly_five_sources(self) -> None:
         assert len(SOURCES) == 5
@@ -142,12 +151,14 @@ class TestRunSeed:
 
         session = await driver.session.return_value.__aenter__()
         # concepts + entities + decisions + sources + causal links
+        # + supersedes links
         expected_calls = (
             len(CONCEPTS)
             + len(ENTITIES)
             + len(DECISIONS)
             + len(SOURCES)
             + len(seed_run._CAUSAL_LINKS)
+            + len(seed_run._SUPERSEDES_LINKS)
         )
         assert session.run.await_count == expected_calls
 

@@ -26,3 +26,4 @@ Thumbs.db
 
 jwt_private.pem
 jwt_public.pem
+passwordFile

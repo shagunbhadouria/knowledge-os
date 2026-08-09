@@ -572,3 +572,329 @@ kind of thing that erodes trust in the rest of the docs. Fixed both.
   Update 3), not by an actual `docker compose up`.
 - This has not run inside real GitHub Actions — only reproduced
   locally via a wiped environment to approximate a clean CI runner.
+
+---
+
+## 2026-08-08 — Post-Phase-3 local verification: mongot replaced, remaining TestClient converted
+
+**Decision — MongoDB local vector search: `mongodb-community-server` +
+standalone `mongot` sidecar → `mongodb/mongodb-atlas-local`**
+
+The two-container wiring locked in the "MongoDB Vector Search (local
+dev)" decision above (`mongodb-community-server:8.2` +
+`mongodb-community-search:0.64.0`, manually pointed at each other via
+`--setParameter searchIndexManagementHostAndPort` and a shared
+`/etc/mongot/secrets/passwordFile`) never got past mongot's own
+startup checks in practice:
+
+1. mongot's strict Unix permission check on the password file
+   (owner-read-only) cannot be satisfied by a Windows bind-mount —
+   Docker Desktop's WSL2/Hyper-V translation layer does not preserve
+   `chmod` bits from the host, so mongot always sees the file as "too
+   permissive" regardless of what permissions are set on Windows.
+2. Even setting that aside, the wiring never configured an actual
+   auth user between mongod and mongot — the password file existed
+   as a bind-mounted secret but nothing on the mongod side was set up
+   to authenticate against it.
+
+Replaced with `mongodb/mongodb-atlas-local:latest` — MongoDB's own
+official single-container image for local dev, bundling `mongod` +
+`mongot` + the runner process that wires the two together internally,
+with no manual sync-source config or credential file needed. Same
+`$vectorSearch` capability as the sidecar approach. Services dropped
+from 6 to 5 in `docker-compose.yml` (the standalone `mongot`
+container and `mongot_data` volume are gone).
+
+**Rejected**: continuing to debug the sidecar wiring (the underlying
+Windows permission-translation issue has no host-side fix — this
+isn't specific to this project's config, it is a documented class of
+problem with bind-mounting Unix-permission-strict secrets through
+Docker Desktop on Windows). Reverting to Atlas-only (no local vector
+search) was also considered and rejected — local `$vectorSearch` is a
+real capability worth keeping, `mongodb-atlas-local` gets it without
+the sidecar's operational fragility.
+
+This is a deviation from Blueprint 2.2/2.3's locked stack line
+("MongoDB Atlas Vector Search... Community 8.2 local sidecar") —
+logged here per Rule R-68. The `docker-compose.yml` code comment on
+the `mongodb` service instructed logging this and was not followed up
+on until this entry; flagging that gap itself, since Rule R-76 is
+explicit that the Journal/CHANGELOG must be updated the same session,
+not reconstructed later from a comment that says "remember to write
+this down."
+
+**Verified**: `docker compose up -d` — all 5 services reach a running
+state fresh (`mongodb` and `neo4j` report Docker healthcheck
+`healthy`) on a clean pull with no prior local state. Confirmed on a
+second machine (different Windows laptop, fresh `docker compose pull`
++ `up`), not just the original dev machine.
+
+**Fixed — `app/test_health.py`: last remaining sync `TestClient`
+usage converted to `httpx.AsyncClient`/`ASGITransport`**
+
+The three `tests/test_phase3_integration_*.py` files were converted
+from Starlette's sync `TestClient` to async `AsyncClient` earlier this
+phase (to fix a real event-loop collision under session-scoped
+pytest-asyncio fixtures — see the Phase 3 integration-test entries
+above). `app/test_health.py` was missed in that pass — it's a
+mock-based unit test file with no real database driver involved, so
+it never hit the same event-loop *collision* bug, but it kept emitting
+`StarletteDeprecationWarning: Using httpx with starlette.testclient is
+deprecated; install httpx2 instead` on every run.
+
+Converted all 15 test functions from sync `def` to `async def`
+(2 helper/count-only tests that never touch the client stayed sync),
+replaced the `_client() -> TestClient` helper with an async
+context-manager version yielding `httpx.AsyncClient` against
+`ASGITransport`, and rewrote every call site from `_client().get(...)`
+to `async with _client() as client: await client.get(...)`.
+
+**Verified**: assertion count (66) and test function count (17)
+identical before and after the rewrite — nothing dropped in the
+conversion. `ruff check`/`ruff format --check` clean. `mypy` strict
+clean. All 29 collected tests (17 named + 13 parametrized cases from
+`test_every_stub_endpoint_returns_standard_501_envelope`) pass. Ran
+with `-W error::DeprecationWarning` to force any remaining deprecation
+warning to fail the run — passed clean, confirming the warning is
+actually gone rather than just not printed. Full non-integration suite
+(`pytest -m "not integration"`) still passes at 108/108 after the
+change, confirming no interaction with the shared `conftest.py`
+session-scoped event loop fixture.
+
+**Still outstanding**: CI has not been exercised against real GitHub
+Actions — the `integration-tests` job (mongo/neo4j/redis service
+containers) has only been validated by local `docker compose`
+runs and YAML parsing, not an actual push. First real push and CI run
+is the next step before this phase can be called fully closed.
+
+---
+
+## 2026-08-09 — First live run of `pytest -m integration` inside the running container stack: 2 real bugs found and fixed
+
+Every previous integration-test run in this project's history was
+either against a broken/never-fully-up container stack, or run via
+`docker compose run --rm omnirag-api pytest ...` (a fresh, separate
+container) rather than the actual long-running `omnirag-api` container
+started by `docker compose up -d`. This is the first time the suite
+ran against a genuinely healthy, fully-up stack — `docker compose ps`
+confirmed all 5 services `healthy`/`Started` on a clean
+`docker compose up -d --build` with no prior state (Windows laptop,
+`mongodb-atlas-local`). Result: 22 passed, 1 skipped (expected — no
+mongot sidecar in the atlas-local setup), 8 failed. All 8 traced back
+to exactly two root causes.
+
+**Fixed — `conftest.py`: `MONGODB_URI` override was clobbering the
+Docker-internal hostname, not just the database name**
+
+The override at the bottom of `conftest.py` existed to force every
+test onto an isolated `omnirag_test` database rather than the real
+seeded `omnirag` one (correct intent, comment explains it well) — but
+it did this by replacing the *entire* `MONGODB_URI` string with a
+hardcoded `mongodb://localhost:27017/omnirag_test`, discarding
+whatever host `docker-compose.yml` had already set via
+`MONGODB_URI: ${MONGODB_URI:-mongodb://mongodb:27017/omnirag?...}`.
+`localhost` only resolves to anything when pytest runs on the bare
+host; inside the `omnirag-api` container itself (where these tests are
+actually meant to run — see the file's own comment), `localhost:27017`
+means "port 27017 on this container," which nothing is listening on.
+`NEO4J_URI` was never given this treatment (only
+`os.environ.setdefault()`, correctly preserving whatever host was
+already set) — the asymmetry between the two was the tell.
+
+Fixed to swap only the trailing database-name segment of whatever URI
+is already present, preserving host, port, and query string exactly
+(e.g. `mongodb://mongodb:27017/omnirag?directConnection=true` becomes
+`mongodb://mongodb:27017/omnirag_test?directConnection=true`).
+
+**Verified**: this bug produced `pymongo.errors.ServerSelectionTimeoutError:
+localhost:27017: [Errno 111] Connection refused` on every MongoDB-touching
+integration test (5 tests), plus 2 further failures once traced through —
+`mongodb.verify_connectivity()` returning `False` correctly cascaded
+into the real `/api/v1/health` endpoint reporting `mongodb: unhealthy`
+and overall `status: "degraded"` (the app's own logic was correct
+throughout; it was accurately reporting a real connectivity failure
+caused by this bug, not misbehaving).
+
+**Fixed — stale decision-count assertion in
+`test_get_decision_history_filters_by_status_against_real_index`**
+
+`assert len(history) == len(DECISIONS)` with the comment "both seed
+decisions are active" dates from before this session's earlier
+addition of a third, `superseded` Decision node (to exercise the
+temporal-reversal code path — see the "reversed Decision +
+SUPERSEDES" entry above). `DECISIONS` now has 3 entries, 2 active —
+filtering by `status="active"` correctly returns 2, which the stale
+assertion read as a failure. Fixed to compare against the actual count
+of active seed decisions rather than the total.
+
+**Verified**: `ruff check`/`ruff format --check` clean on both changed
+files. `mypy` strict clean. Full `docker compose ps` confirmed 5/5
+containers healthy before the fix; the specific failing assertions
+(`assert False is True`, `assert 'degraded' == 'starting'`, `assert 2
+== 3`, and the 5 `ServerSelectionTimeoutError` tracebacks) map exactly
+one-to-one onto these two root causes with no unexplained remainder.
+Re-run against the live stack pending confirmation.
+
+---
+
+## 2026-08-09 (same day, continued) — 30/31 integration tests passing live; last skip root-caused and fixed
+
+Re-ran `pytest -m integration` against the live stack after the
+`conftest.py` and stale-assertion fixes above: **30 passed, 1 skipped**
+— every failure from the previous run is gone. The 1 skip
+(`TestMongoVectorSearchIndexAgainstRealServer::test_ensure_vector_search_index_creates_and_is_idempotent`)
+was expected in principle (this class's own docstring says it only
+runs where real `$vectorSearch` is available) but its skip *message*
+was stale, still blaming an unreachable "mongot sidecar" from the
+architecture this project no longer uses. Traced the actual swallowed
+exception directly (bypassing the test's own broad `except Exception`)
+via `docker compose run --rm omnirag-api python -c "..."` and found a
+real, different, fixable bug underneath the stale message.
+
+**Fixed — `app/database/mongodb.py`: `ensure_vector_search_index()`
+requires the `embeddings` collection to exist before indexing it**
+
+Real error: `pymongo.errors.OperationFailure: ... Collection
+'omnirag.embeddings' does not exist ... 'codeName':
+'NamespaceNotFound'`. `get_embeddings_collection()` returns a lazy
+Python-side handle - referencing `database["embeddings"]` does not
+create anything on the MongoDB server until a document is actually
+inserted through it. On a fresh database (empty volume, no embeddings
+ever written yet - exactly the state right after `docker compose up`
+on a clean pull), `create_search_index()` fails outright because the
+collection genuinely does not exist server-side yet. Not a
+mongot/atlas-local capability problem at all - a real ordering
+requirement this function never satisfied.
+
+Fixed by explicitly calling `database.create_collection("embeddings")`
+first, wrapped in the same idempotent-catch style already used for the
+search index creation immediately below it (PyMongo's
+`create_collection` has no `IF NOT EXISTS` equivalent either - it
+raises `CollectionInvalid` if the collection is already there, which
+is caught and logged rather than treated as an error).
+
+Also updated the stale docstring and skip message on
+`TestMongoVectorSearchIndexAgainstRealServer` (tests/test_phase3_integration_infra.py)
+to describe the current `mongodb-atlas-local` architecture instead of
+the retired sidecar setup - the class-level skip-on-CI behavior itself
+was already correct and unchanged, only the wording was wrong.
+
+---
+
+## 2026-08-09 (same day, continued) — 31/31 integration tests confirmed; CI never actually run until now, two real bugs found in it
+
+The previous entry ended with "expect 31/31... pending confirmation."
+Re-ran `pytest -m integration` against the live stack after the
+`ensure_vector_search_index()` fix: **31 passed, 0 failed, 0 skipped**
+— every integration test in the suite now passes against real
+Neo4j/MongoDB/Redis, including the vector-search index test that had
+been skipping or failing in every prior run this project has had.
+
+**Verified separately, same session: `pytest -m "not integration"` —
+108 passed, 0 failed, no warnings summary at all** (the `httpx2`
+warning present in every earlier run of this file is confirmed gone).
+
+**Found — CI (`.github/workflows/ci.yml`) had never actually been run
+against real GitHub Actions.** Every prior CHANGELOG entry says this
+explicitly ("Still outstanding: CI has not been exercised against real
+GitHub Actions"). Reading the file line-by-line before the first real
+push surfaced two bugs that only running it live would otherwise have
+caught — silently, on a failed push, at the worst possible time:
+
+**Bug 1 — `integration-tests` job's `/health` verification step
+imported a module-level `app` that has never existed.**
+`from app.main import app` — `app/main.py` uses a `create_app()`
+factory pattern; there is no module-level `app` variable, and never
+has been. This is the exact same `ImportError` hit and diagnosed
+earlier this session when trying to introspect routes directly inside
+the container (`docker compose exec omnirag-api python -c "from
+app.main import app; ..."`). The CI file was written against the same
+wrong assumption and would have failed the `integration-tests` job on
+literally the first real push, on a step that has nothing to do with
+integration-test correctness — a false-negative CI failure. Fixed:
+`from app.main import create_app`, `ASGITransport(app=create_app())`.
+
+**Bug 2 — CI's `integration-tests` job ran `mongo:7`, not
+`mongodb/mongodb-atlas-local` — silently untested vector search.**
+`docker-compose.yml` has run `mongodb-atlas-local` since the mongot
+replacement decision earlier this session; CI's `services:` block was
+never updated to match and still pulled plain `mongo:7`, which has no
+`$vectorSearch`/mongot capability at all. Nothing in the current test
+suite depends on this yet (`TestMongoVectorSearchIndexAgainstRealServer`
+skips gracefully when unavailable — see the prior entry's "1 skipped"
+note), so this was not failing CI, only silently failing to *cover*
+Atlas Vector Search in CI at all. Initially flagged as a known gap and
+deliberately deferred (Rule R-68) rather than guessed at, since an
+earlier web search suggested `mongodb-atlas-local` might not be
+compatible with GitHub Actions' `services:` container contract at all
+(bundles its own mongod+mongot+runner startup, unlike a plain
+single-process image).
+
+Re-searched properly before deferring further: the incompatibility was
+real but time-boxed — a MongoDB image push in Feb 2025 briefly broke
+`mongodb-atlas-local` specifically under GitHub Actions' `services:`
+health-check polling (container reported permanently "unhealthy" on
+Linux runners; worked fine under plain Docker Compose the whole time).
+MongoDB's own maintainer confirmed and fixed it the same day on the
+community forum (mongodb.com/community/forums/t/mongodb-mongodb-atlas-local-not-working-in-github-actions/311906).
+Current images work as an ordinary `services:` container — same shape
+as `mongo:7` — image/ports/health-cmd, nothing special. Fixed: swapped
+to `mongodb/mongodb-atlas-local:latest`, health check copied verbatim
+from `docker-compose.yml`'s own `mongodb` service
+(`mongosh --quiet --eval "db.adminCommand('ping').ok"`, 30 retries,
+20s start period) so both environments assert identical readiness
+semantics rather than two independently-guessed checks.
+
+**Also fixed this session, `app/database/test_database.py` — Mongo
+connectivity-failure test was patching an object the code under test
+never actually touched.** `test_verify_connectivity_returns_false_on_connection_failure`
+did `client = mongodb.get_client(); patch.object(client.admin,
+"command", ...)`. `get_client()` genuinely is a correct singleton
+(verified: same object on repeated calls) — the bug is one level
+deeper. Motor/PyMongo's `client.admin` is a computed property that
+constructs a *new* `AsyncIOMotorDatabase` wrapper object on every
+access, not a cached attribute (confirmed against Motor's own docs and
+source before concluding this, not assumed from the symptom alone).
+The test's `client.admin` and `verify_connectivity()`'s internal
+`get_client().admin` calls were therefore two different objects; the
+patched mock never engaged, `result is False` failed with `assert True
+is False`. `app/database/neo4j.py`'s equivalent test never had this
+bug — it patches `driver.session` directly, which *is* stable, and
+that asymmetry between the two files was the actual tell. Fixed by
+patching `get_client()` itself (via `patch.object(mongodb,
+"get_client", return_value=mock_client)`) rather than a sub-attribute
+of its return value, so every access — inside the test and inside
+`verify_connectivity()` — resolves to the same controllable mock.
+
+**Verified**: `ruff check`/`mypy app` strict clean across all changed
+files. `pytest -m "not integration"` — 108 passed, 0 failed, 0
+warnings, confirmed on two separate fresh working directories (a
+mid-session zip and a later "final" zip pulled from the same repo
+state) to rule out a fix that only happened to work in one copy.
+`docker compose ps` reconfirmed all 5 services healthy on the second
+working directory independently, not assumed carried over from the
+first. CI fixes themselves have been read and reasoned through
+line-by-line but **not yet verified against a real GitHub Actions
+run** — that remains the one thing in this file that still says
+"pending" honestly: push to `github.com/shagunbhadouria/knowledge-os`
+and check the Actions tab is the actual verification step, not this
+entry.
+
+**Still outstanding, stated plainly, not glossed over:**
+- First real GitHub Actions run — this CHANGELOG has said "CI has
+  never been exercised against real GitHub Actions" for two
+  consecutive entries now; this entry fixes two bugs that would have
+  caused that first real run to fail, but does not itself constitute
+  that run. Push, watch the Actions tab, report back what actually
+  happens — a green run is the only remaining unverified claim in
+  Phase 1–3's entire history.
+- Baseline Neo4j query latency: **now actually done**, contradicting
+  every earlier entry in this file that marked it blocked pending
+  DOC-03. A benchmark script (`app/scripts/benchmark_neo4j.py`) was
+  written and run live against the real seeded corpus: fulltext
+  concept lookup p50 1.53ms / p95 3.52ms, 1-hop CAUSED traversal p50
+  0.89ms / p95 1.53ms (50 runs each, corpus: 3 Concepts/3 Entities/3
+  Decisions/5 Sources). The Engineering Journal (DOC-03) itself was
+  still never provided to paste this into directly — the numbers
+  exist and are verified; the act of writing them into that specific
+  document is the user's remaining step, not a blocked one.

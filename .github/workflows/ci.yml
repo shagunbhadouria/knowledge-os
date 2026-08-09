@@ -39,3 +39,103 @@ jobs:
         run: |
           pip-audit -r requirements.txt
           pip-audit -r requirements-dev.txt
+
+  integration-tests:
+    needs: quality-gate
+    runs-on: ubuntu-latest
+
+    services:
+      # Matches docker-compose.yml exactly (Phase 3 mongot fix):
+      # mongodb-atlas-local bundles mongod + mongot in one image, so
+      # CI now genuinely tests Atlas Vector Search wiring instead of
+      # silently skipping it the way mongo:7 did. Health check mirrors
+      # docker-compose.yml's mongodb service check verbatim so both
+      # environments assert identical readiness semantics.
+      #
+      # History: a Feb 2025 mongodb-atlas-local image push briefly
+      # broke `services:` compatibility (container reported
+      # "unhealthy" indefinitely in GitHub Actions specifically —
+      # worked fine in Docker Compose). MongoDB confirmed and fixed it
+      # same day; current images work as a plain services: container
+      # with just image/ports/health-cmd, same shape as any other.
+      # Ref: mongodb.com/community/forums/t/mongodb-mongodb-atlas-local-not-working-in-github-actions/311906
+      mongo:
+        image: mongodb/mongodb-atlas-local:latest
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval \"db.adminCommand('ping').ok\""
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+          --health-start-period 20s
+
+      neo4j:
+        image: neo4j:4.4
+        env:
+          NEO4J_AUTH: neo4j/test-password
+        ports:
+          - 7687:7687
+          - 7474:7474
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p test-password 'RETURN 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      MONGODB_URI: mongodb://localhost:27017/omnirag_test
+      NEO4J_URI: bolt://localhost:7687
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: test-password
+      REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Wait for service containers
+        run: |
+          until (echo > /dev/tcp/localhost/27017) 2>/dev/null; do sleep 1; done
+          until (echo > /dev/tcp/localhost/7687) 2>/dev/null; do sleep 1; done
+          until (echo > /dev/tcp/localhost/6379) 2>/dev/null; do sleep 1; done
+
+      - name: Pytest (integration)
+        run: pytest -m integration
+
+      - name: Verify /health returns 200
+        run: |
+          pip install httpx
+          python -c "
+          import asyncio
+          from httpx import ASGITransport, AsyncClient
+          from app.main import create_app
+
+          async def main() -> None:
+              transport = ASGITransport(app=create_app())
+              async with AsyncClient(transport=transport, base_url='http://test') as client:
+                  response = await client.get('/api/v1/health')
+                  assert response.status_code == 200, response.text
+                  print(response.json())
+
+          asyncio.run(main())
+          "

@@ -1,7 +1,10 @@
 """Tests for Phase 2 health endpoint and route stub wiring."""
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 import pytest
-from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 
 from app.main import create_app
 
@@ -27,58 +30,109 @@ _STUB_ENDPOINTS: list[tuple[str, str, dict[str, object] | None]] = [
 ]
 
 
-def _client() -> TestClient:
-    return TestClient(create_app(), raise_server_exceptions=False)
+@asynccontextmanager
+async def _client() -> AsyncIterator[AsyncClient]:
+    # httpx.AsyncClient against ASGITransport instead of Starlette's
+    # sync TestClient - same reason as
+    # tests/test_phase3_integration_infra.py: TestClient runs the app
+    # in its own background thread with its own anyio event loop,
+    # which triggers a StarletteDeprecationWarning ("Using `httpx`
+    # with `starlette.testclient` is deprecated; install `httpx2`
+    # instead") on every call. This file's tests are all mock-based
+    # unit tests with no real database driver involved, so there was
+    # never an actual event-loop *collision* bug here (unlike the
+    # integration tests) - this conversion is purely to remove the
+    # deprecation warning at its source instead of suppressing it.
+    transport = ASGITransport(app=create_app())
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
 
 
-def test_health_returns_degraded_status_with_service_map() -> None:
-    # Phase 3: mongodb/neo4j/redis now run real connectivity checks
-    # (Rule R-89). No real database is reachable in this unit-test
-    # process (conftest.py points at localhost URIs nothing is
-    # listening on), so each reports "unhealthy" honestly rather than
-    # a faked "healthy" -- and ollama, which has no client wired until
-    # Phase 5, still reports "starting". Overall status is "degraded"
-    # per app/shared/health.py's aggregation rule: any "unhealthy"
-    # service means the whole system is degraded, not "starting".
-    response = _client().get("/api/v1/health")
+async def test_health_returns_degraded_status_with_service_map() -> None:
+    # This test controls exactly which services report healthy/unhealthy
+    # via explicit mocks, rather than relying on which real hosts happen
+    # to be reachable from wherever pytest runs. The previous version
+    # assumed conftest.py's localhost URIs meant *nothing* would be
+    # reachable — true when run outside Docker (e.g. bare-host CI), but
+    # false when run inside the omnirag-api container itself, where
+    # neo4j and redis are genuinely reachable over the Docker network.
+    # Mocking verify_connectivity() directly makes this test assert the
+    # app's aggregation logic (any unhealthy -> "degraded") regardless
+    # of where or how it's executed.
+    from unittest.mock import AsyncMock, patch
+
+    from app.database import mongodb, neo4j, redis
+
+    with (
+        patch.object(mongodb, "verify_connectivity", new=AsyncMock(return_value=False)),
+        patch.object(neo4j, "verify_connectivity", new=AsyncMock(return_value=True)),
+        patch.object(redis, "verify_connectivity", new=AsyncMock(return_value=True)),
+    ):
+        async with _client() as client:
+            response = await client.get("/api/v1/health")
 
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "degraded"
     assert body["services"]["mongodb"] == "unhealthy"
-    assert body["services"]["neo4j"] == "unhealthy"
-    assert body["services"]["redis"] == "unhealthy"
+    assert body["services"]["neo4j"] == "healthy"
+    assert body["services"]["redis"] == "healthy"
     assert body["services"]["ollama"] == "starting"
     assert set(body["services"]) == {"mongodb", "neo4j", "redis", "ollama"}
 
 
-def test_response_carries_request_id_header() -> None:
-    response = _client().get("/api/v1/health")
+async def test_health_returns_healthy_status_when_all_real_services_are_up() -> None:
+    # Companion case: every dependency healthy -> overall "healthy",
+    # not "degraded" or "starting". Ollama stays "starting" by design
+    # until Phase 5, so full "healthy" is intentionally untestable
+    # until then — this asserts the three real checks succeeding.
+    from unittest.mock import AsyncMock, patch
+
+    from app.database import mongodb, neo4j, redis
+
+    with (
+        patch.object(mongodb, "verify_connectivity", new=AsyncMock(return_value=True)),
+        patch.object(neo4j, "verify_connectivity", new=AsyncMock(return_value=True)),
+        patch.object(redis, "verify_connectivity", new=AsyncMock(return_value=True)),
+    ):
+        async with _client() as client:
+            response = await client.get("/api/v1/health")
+
+    body = response.json()
+    assert body["services"]["mongodb"] == "healthy"
+    assert body["services"]["neo4j"] == "healthy"
+    assert body["services"]["redis"] == "healthy"
+    # ollama still "starting" -> overall cannot be "healthy" yet
+    assert body["status"] == "starting"
+
+
+async def test_response_carries_request_id_header() -> None:
+    async with _client() as client:
+        response = await client.get("/api/v1/health")
 
     assert response.headers.get("X-Request-ID")
 
 
-def test_security_and_request_id_headers_present_on_error_responses() -> None:
+async def test_security_and_request_id_headers_present_on_error_responses() -> None:
     # Headers were previously only verified on the /health success path.
     # Middleware runs for every response regardless of status code, so
     # confirm that holds on both a 501 stub and a 400 validation error —
     # not just the happy path.
-    client = _client()
+    async with _client() as client:
+        stub_response = await client.get("/api/v1/gaps")
+        assert stub_response.status_code == 501
+        assert stub_response.headers.get("X-Request-ID")
+        assert stub_response.headers.get("X-Content-Type-Options") == "nosniff"
+        assert stub_response.headers.get("X-Frame-Options") == "DENY"
 
-    stub_response = client.get("/api/v1/gaps")
-    assert stub_response.status_code == 501
-    assert stub_response.headers.get("X-Request-ID")
-    assert stub_response.headers.get("X-Content-Type-Options") == "nosniff"
-    assert stub_response.headers.get("X-Frame-Options") == "DENY"
-
-    validation_response = client.post("/api/v1/query", json={})
-    assert validation_response.status_code == 400
-    assert validation_response.headers.get("X-Request-ID")
-    assert validation_response.headers.get("X-Content-Type-Options") == "nosniff"
-    assert validation_response.headers.get("X-Frame-Options") == "DENY"
+        validation_response = await client.post("/api/v1/query", json={})
+        assert validation_response.status_code == 400
+        assert validation_response.headers.get("X-Request-ID")
+        assert validation_response.headers.get("X-Content-Type-Options") == "nosniff"
+        assert validation_response.headers.get("X-Frame-Options") == "DENY"
 
 
-def test_unknown_route_returns_standard_envelope_not_raw_404() -> None:
+async def test_unknown_route_returns_standard_envelope_not_raw_404() -> None:
     # Regression test: an unmatched route is rejected by Starlette's
     # router before it ever reaches an OmniRAGError-raising handler, so
     # this path bypasses the normal error flow entirely. Without a
@@ -88,7 +142,8 @@ def test_unknown_route_returns_standard_envelope_not_raw_404() -> None:
     # ("every endpoint has a standard response envelope, no
     # exceptions"). Caught by actually calling the route, not by
     # reading the handler registration and assuming it was covered.
-    response = _client().get("/api/v1/this-route-does-not-exist")
+    async with _client() as client:
+        response = await client.get("/api/v1/this-route-does-not-exist")
 
     assert response.status_code == 404
     envelope = response.json()
@@ -99,11 +154,14 @@ def test_unknown_route_returns_standard_envelope_not_raw_404() -> None:
     assert envelope["meta"]["request_id"]
 
 
-def test_wrong_method_on_real_route_returns_standard_envelope_not_raw_405() -> None:
+async def test_wrong_method_on_real_route_returns_standard_envelope_not_raw_405() -> (
+    None
+):
     # Same gap, same fix, different trigger: Starlette raises a 405 for
     # a real route called with an unsupported method, also before any
     # app route handler runs.
-    response = _client().delete("/api/v1/query")
+    async with _client() as client:
+        response = await client.delete("/api/v1/query")
 
     assert response.status_code == 405
     envelope = response.json()
@@ -112,12 +170,13 @@ def test_wrong_method_on_real_route_returns_standard_envelope_not_raw_405() -> N
     assert envelope["meta"]["request_id"]
 
 
-def test_error_response_request_id_matches_header() -> None:
+async def test_error_response_request_id_matches_header() -> None:
     # The request_id in the JSON body's meta must be the exact same
     # value as the X-Request-ID response header, not an independently
     # generated UUID — otherwise a client reporting the body's
     # request_id would never find a matching structured-log line.
-    response = _client().get("/api/v1/this-route-does-not-exist")
+    async with _client() as client:
+        response = await client.get("/api/v1/this-route-does-not-exist")
 
     header_id = response.headers.get("X-Request-ID")
     body_id = response.json()["meta"]["request_id"]
@@ -125,11 +184,15 @@ def test_error_response_request_id_matches_header() -> None:
 
 
 @pytest.mark.parametrize("method,path,body", _STUB_ENDPOINTS)
-def test_every_stub_endpoint_returns_standard_501_envelope(
+async def test_every_stub_endpoint_returns_standard_501_envelope(
     method: str, path: str, body: dict[str, object] | None
 ) -> None:
-    client = _client()
-    response = client.post(path, json=body) if method == "post" else client.get(path)
+    async with _client() as client:
+        response = (
+            await client.post(path, json=body)
+            if method == "post"
+            else await client.get(path)
+        )
 
     assert response.status_code == 501, f"{method.upper()} {path}"
     envelope = response.json()
@@ -142,14 +205,16 @@ def test_every_stub_endpoint_returns_standard_501_envelope(
 
 def test_all_18_endpoints_are_accounted_for() -> None:
     # +1 for /health, +1 for /query/stream (SSE, tested separately --
-    # TestClient does not stream, see test below), +3 for the routes
-    # Phase 3 made real (workspace/status, graph/nodes, graph/node/{id},
-    # tested directly below rather than via the generic 501 stub list).
+    # a plain client does not stream, see test below), +3 for the
+    # routes Phase 3 made real (workspace/status, graph/nodes,
+    # graph/node/{id}, tested directly below rather than via the
+    # generic 501 stub list).
     assert len(_STUB_ENDPOINTS) + 2 + 3 == 18
 
 
-def test_missing_required_field_returns_400_validation_error_with_field_name() -> None:
-    response = _client().post("/api/v1/query", json={})
+async def test_missing_required_field_returns_400_with_field_name() -> None:
+    async with _client() as client:
+        response = await client.post("/api/v1/query", json={})
 
     assert response.status_code == 400
     envelope = response.json()
@@ -159,16 +224,18 @@ def test_missing_required_field_returns_400_validation_error_with_field_name() -
     assert envelope["error"]["fields"][0]["field"] == "question"
 
 
-def test_query_stream_route_exists_and_is_wired() -> None:
-    # GET /query/stream is SSE — verified separately since TestClient's
-    # synchronous client cannot properly consume a streaming response.
-    # Confirming the route resolves (vs 404) is what matters at Phase 2.
-    response = _client().get("/api/v1/query/stream", params={"question": "why?"})
+async def test_query_stream_route_exists_and_is_wired() -> None:
+    # GET /query/stream is SSE — verified separately since a plain
+    # request/response client cannot properly consume a streaming
+    # response. Confirming the route resolves (vs 404) is what matters
+    # at Phase 2.
+    async with _client() as client:
+        response = await client.get("/api/v1/query/stream", params={"question": "why?"})
 
     assert response.status_code == 501
 
 
-def test_workspace_status_calls_repository_and_shapes_the_response() -> None:
+async def test_workspace_status_calls_repository_and_shapes_the_response() -> None:
     # Phase 3: GET /workspace/status is real now. Repository calls are
     # mocked here (no live Neo4j in this unit-test process) - the
     # real-service proof is tests/test_phase3_integration_seed_and_graph.py.
@@ -194,7 +261,8 @@ def test_workspace_status_calls_repository_and_shapes_the_response() -> None:
             repository, "get_unanswered_question_count", new=AsyncMock(return_value=2)
         ),
     ):
-        response = _client().get("/api/v1/workspace/status")
+        async with _client() as client:
+            response = await client.get("/api/v1/workspace/status")
 
     assert response.status_code == 200
     body = response.json()
@@ -205,7 +273,9 @@ def test_workspace_status_calls_repository_and_shapes_the_response() -> None:
     assert body["last_ingested_at"] == "2025-07-01T00:00:00+00:00"
 
 
-def test_workspace_status_reports_null_last_ingested_when_graph_is_empty() -> None:
+async def test_workspace_status_reports_null_last_ingested_when_graph_is_empty() -> (
+    None
+):
     from unittest.mock import AsyncMock, patch
 
     from app.graph import repository
@@ -223,22 +293,24 @@ def test_workspace_status_reports_null_last_ingested_when_graph_is_empty() -> No
             repository, "get_unanswered_question_count", new=AsyncMock(return_value=0)
         ),
     ):
-        response = _client().get("/api/v1/workspace/status")
+        async with _client() as client:
+            response = await client.get("/api/v1/workspace/status")
 
     assert response.status_code == 200
     assert response.json()["last_ingested_at"] is None
 
 
-def test_list_nodes_requires_the_type_query_parameter() -> None:
+async def test_list_nodes_requires_the_type_query_parameter() -> None:
     # Blueprint 2.4 locks ?type=Concept as required - omitting it must
     # be a 400 VALIDATION_ERROR, not a 500 or a silently-empty list.
-    response = _client().get("/api/v1/graph/nodes")
+    async with _client() as client:
+        response = await client.get("/api/v1/graph/nodes")
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
-def test_list_nodes_returns_nodes_and_total_for_a_valid_type() -> None:
+async def test_list_nodes_returns_nodes_and_total_for_a_valid_type() -> None:
     from unittest.mock import AsyncMock, patch
 
     from app.graph import repository
@@ -248,7 +320,10 @@ def test_list_nodes_returns_nodes_and_total_for_a_valid_type() -> None:
         "list_nodes_by_label",
         new=AsyncMock(return_value=([{"name": "PostgreSQL"}], 1)),
     ):
-        response = _client().get("/api/v1/graph/nodes", params={"type": "Concept"})
+        async with _client() as client:
+            response = await client.get(
+                "/api/v1/graph/nodes", params={"type": "Concept"}
+            )
 
     assert response.status_code == 200
     body = response.json()
@@ -257,7 +332,7 @@ def test_list_nodes_returns_nodes_and_total_for_a_valid_type() -> None:
     assert body["nodes"][0]["properties"] == {"name": "PostgreSQL"}
 
 
-def test_get_node_returns_404_when_repository_finds_nothing() -> None:
+async def test_get_node_returns_404_when_repository_finds_nothing() -> None:
     from unittest.mock import AsyncMock, patch
 
     from app.graph import repository
@@ -265,15 +340,16 @@ def test_get_node_returns_404_when_repository_finds_nothing() -> None:
     with patch.object(
         repository, "get_node_by_label_and_key", new=AsyncMock(return_value=None)
     ):
-        response = _client().get(
-            "/api/v1/graph/node/DoesNotExist", params={"type": "Concept"}
-        )
+        async with _client() as client:
+            response = await client.get(
+                "/api/v1/graph/node/DoesNotExist", params={"type": "Concept"}
+            )
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "NOT_FOUND"
 
 
-def test_get_node_returns_node_detail_when_found() -> None:
+async def test_get_node_returns_node_detail_when_found() -> None:
     from unittest.mock import AsyncMock, patch
 
     from app.graph import repository
@@ -283,9 +359,10 @@ def test_get_node_returns_node_detail_when_found() -> None:
         "get_node_by_label_and_key",
         new=AsyncMock(return_value={"name": "PostgreSQL", "confidence_score": 0.9}),
     ):
-        response = _client().get(
-            "/api/v1/graph/node/PostgreSQL", params={"type": "Concept"}
-        )
+        async with _client() as client:
+            response = await client.get(
+                "/api/v1/graph/node/PostgreSQL", params={"type": "Concept"}
+            )
 
     assert response.status_code == 200
     body = response.json()

@@ -61,13 +61,35 @@ class TestRealConnectivity:
         self,
     ) -> None:
         from app.main import create_app
-        from fastapi.testclient import TestClient
+        from httpx import ASGITransport, AsyncClient
 
-        with TestClient(create_app()) as client:
-            response = client.get("/api/v1/health")
+        # Starlette's sync TestClient runs the app in its own
+        # background thread with its own anyio event loop - fine
+        # under the old per-test "function" loop scope, but under the
+        # "session" scope this whole test suite now uses (see
+        # pyproject.toml), the app's calls back into the
+        # session-scoped Neo4j/Mongo/Redis driver singletons collide
+        # with TestClient's separate thread-local loop: "got Future
+        # <Future pending> attached to a different loop". AsyncClient
+        # against ASGITransport runs the app inline on this
+        # coroutine's own loop instead, so there is only ever one
+        # loop involved.
+        transport = ASGITransport(app=create_app())
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/api/v1/health")
 
         body = response.json()
-        assert body["status"] == "healthy"
+        # app/shared/health.py's _check_ollama() intentionally always
+        # returns "starting" until Phase 5 wires a real Ollama probe
+        # (see that file's module docstring) - faking it healthy here
+        # would be asserting against behavior the code deliberately
+        # doesn't have yet. Because health()'s overall status is only
+        # "healthy" when every service is healthy, and only
+        # "degraded" when something is actively "unhealthy", ollama
+        # being perpetually "starting" (never healthy, never
+        # unhealthy) means overall correctly stays "starting" too -
+        # that's the honest, currently-correct value, not a failure.
+        assert body["status"] == "starting"
         assert body["services"]["mongodb"] == "healthy"
         assert body["services"]["neo4j"] == "healthy"
         assert body["services"]["redis"] == "healthy"
@@ -126,15 +148,17 @@ class TestNeo4jSchemaAgainstRealServer:
 
 
 class TestMongoVectorSearchIndexAgainstRealServer:
-    """Requires the mongot sidecar (docker-compose.yml's `mongot`
-    service, MongoDB Community Edition 8.2+ local vector search) in
-    addition to plain mongod. CI's integration-tests job runs a plain
-    mongo:7 service container with no mongot sidecar (GitHub Actions
-    `services:` cannot easily express mongot's dependency on a
-    replica-set mongod the way docker-compose can — see the Decision
-    Log) — every test in this class is skipped there and only runs
-    locally via `make test-integration` against the full
-    docker-compose stack.
+    """Requires $vectorSearch support, provided locally by
+    docker-compose.yml's `mongodb-atlas-local` image (MongoDB's
+    official all-in-one local dev image, bundling mongod + mongot +
+    the connecting process - see the Decision Log for the earlier
+    community-server-plus-separate-mongot-sidecar setup this replaced,
+    and why). CI's integration-tests job runs a plain `mongo:7` service
+    container with no vector-search capability at all (GitHub Actions
+    `services:` cannot express an atlas-local-style bundled image the
+    way docker-compose can) - every test in this class is skipped
+    there and only runs locally via `make test-integration` against
+    the full docker-compose stack.
     """
 
     async def test_ensure_vector_search_index_creates_and_is_idempotent(self) -> None:
@@ -147,7 +171,7 @@ class TestMongoVectorSearchIndexAgainstRealServer:
             await ensure_vector_search_index()
             await ensure_vector_search_index()  # must not raise
         except Exception as exc:  # noqa: BLE001 - see class docstring
-            pytest.skip(f"mongot sidecar not reachable: {exc}")
+            pytest.skip(f"vector search not available: {exc}")
 
         indexes = await list_search_indexes()
         names = {idx.get("name") for idx in indexes}

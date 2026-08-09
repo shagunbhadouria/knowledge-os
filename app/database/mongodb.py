@@ -137,10 +137,28 @@ async def ensure_vector_search_index() -> None:
     asynchronously... call list_search_indexes() to determine current
     status" - there's no synchronous "already exists" return value to
     check first, only a race-prone list-then-create).
+
+    create_search_index() also requires the target collection to
+    already exist server-side - get_embeddings_collection() only
+    returns a lazy Python-side handle, which does not create anything
+    in MongoDB until a document is actually inserted through it. On a
+    fresh database (e.g. right after `docker compose up` on an empty
+    volume, before any embeddings have been written), the collection
+    genuinely does not exist yet and create_search_index() fails with
+    NamespaceNotFound - not a mongot/atlas-local problem, a genuine
+    ordering requirement. create_collection() below is explicitly
+    idempotent-guarded the same way the index creation is, for the
+    same reason: no "IF NOT EXISTS" equivalent exists here either.
     """
 
-    from pymongo.errors import OperationFailure
+    from pymongo.errors import CollectionInvalid, OperationFailure
     from pymongo.operations import SearchIndexModel
+
+    try:
+        await get_database().create_collection("embeddings")
+        logger.info("mongodb.embeddings_collection_created")
+    except CollectionInvalid:
+        logger.info("mongodb.embeddings_collection_already_exists")
 
     collection = get_embeddings_collection()
     model = SearchIndexModel(

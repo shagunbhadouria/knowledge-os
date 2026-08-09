@@ -152,7 +152,15 @@ class TestSeedScriptAgainstRealServer:
 
         history = await get_decision_history(status="active")
 
-        assert len(history) == len(DECISIONS)  # both seed decisions are "active"
+        # DECISIONS has 3 entries as of the temporal-reversal seed
+        # addition (see app/database/seeds/data.py) - one is
+        # deliberately "superseded" to exercise the reversal code
+        # path, so only 2 are "active". This was asserting
+        # len(DECISIONS) (3) before that addition, back when both
+        # seeded decisions were active - stale once the count/shape of
+        # DECISIONS changed underneath it.
+        active_decisions = [d for d in DECISIONS if d["status"] == "active"]
+        assert len(history) == len(active_decisions)
         assert all(h.decision.status == "active" for h in history)
 
 
@@ -165,12 +173,16 @@ class TestGraphRoutesAgainstRealServer:
 
     async def test_workspace_status_reflects_real_seeded_counts(self) -> None:
         from app.main import create_app
-        from fastapi.testclient import TestClient
+        from httpx import ASGITransport, AsyncClient
 
         await run_seed()
 
-        with TestClient(create_app()) as client:
-            response = client.get("/api/v1/workspace/status")
+        # See test_health_endpoint_reports_all_healthy_against_real_services
+        # in test_phase3_integration_infra.py for why this is
+        # AsyncClient/ASGITransport rather than the sync TestClient.
+        transport = ASGITransport(app=create_app())
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/api/v1/workspace/status")
 
         assert response.status_code == 200
         body = response.json()
@@ -181,12 +193,13 @@ class TestGraphRoutesAgainstRealServer:
 
     async def test_list_nodes_returns_real_seeded_concepts(self) -> None:
         from app.main import create_app
-        from fastapi.testclient import TestClient
+        from httpx import ASGITransport, AsyncClient
 
         await run_seed()
 
-        with TestClient(create_app()) as client:
-            response = client.get(
+        transport = ASGITransport(app=create_app())
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
                 "/api/v1/graph/nodes", params={"type": "Concept", "limit": 10}
             )
 
@@ -198,12 +211,13 @@ class TestGraphRoutesAgainstRealServer:
 
     async def test_get_node_returns_a_real_seeded_concept_by_name(self) -> None:
         from app.main import create_app
-        from fastapi.testclient import TestClient
+        from httpx import ASGITransport, AsyncClient
 
         await run_seed()
 
-        with TestClient(create_app()) as client:
-            response = client.get(
+        transport = ASGITransport(app=create_app())
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
                 "/api/v1/graph/node/PostgreSQL", params={"type": "Concept"}
             )
 
@@ -213,12 +227,13 @@ class TestGraphRoutesAgainstRealServer:
 
     async def test_get_node_returns_404_for_a_name_not_in_the_graph(self) -> None:
         from app.main import create_app
-        from fastapi.testclient import TestClient
+        from httpx import ASGITransport, AsyncClient
 
         await run_seed()
 
-        with TestClient(create_app()) as client:
-            response = client.get(
+        transport = ASGITransport(app=create_app())
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
                 "/api/v1/graph/node/DoesNotExist", params={"type": "Concept"}
             )
 

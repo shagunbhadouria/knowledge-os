@@ -6,7 +6,7 @@ services:
       target: development
     container_name: omnirag-api
     environment:
-      MONGODB_URI: ${MONGODB_URI:-mongodb://mongodb:27017/omnirag?replicaSet=rs0&directConnection=true}
+      MONGODB_URI: ${MONGODB_URI:-mongodb://mongodb:27017/omnirag?directConnection=true}
       NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
       NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-omnirag_password}
@@ -35,8 +35,6 @@ services:
     depends_on:
       mongodb:
         condition: service_healthy
-      mongot:
-        condition: service_started
       neo4j:
         condition: service_healthy
       redis:
@@ -45,43 +43,32 @@ services:
         condition: service_started
 
   mongodb:
-    # Blueprint 2.2 originally locked mongo:7 (Atlas Vector Search
-    # only, cloud-only). Upgraded to MongoDB Community Edition 8.2+
-    # (Decision Log, Phase 3) which added local $vectorSearch support
-    # via a separate mongot sidecar - no Atlas account needed. Vector
-    # search requires MongoDB to run as a replica set even single-node
-    # (--replSet), which is why `command` and the healthcheck below
-    # are new versus the plain mongo:7 setup this replaces.
-    image: mongodb/mongodb-community-server:8.2-ubi8-slim
+    # DECISION LOG UPDATE (post-Phase-3 local testing): the original
+    # two-container wiring (mongodb-community-server + a standalone
+    # mongodb-community-search sidecar, manually pointed at each other
+    # via --setParameter searchIndexManagementHostAndPort) is not the
+    # pattern MongoDB documents for local dev, and it never got an
+    # auth user configured between mongod and mongot. It failed at
+    # the mongot binary/startup stage before that gap even mattered.
+    # Replaced with mongodb/mongodb-atlas-local, MongoDB's own
+    # single-container image that bundles mongod + mongot + the
+    # runner process that wires them together — same $vectorSearch
+    # capability, no manual sync-source or credential wiring needed.
+    # This is a deviation from Blueprint 2.2/2.3's locked stack line
+    # ("MongoDB Atlas Vector Search... Community 8.2 local sidecar")
+    # — log this in the Blueprint Decision Register per Rule R-68.
+    image: mongodb/mongodb-atlas-local:latest
     container_name: omnirag-mongodb
-    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--setParameter", "searchIndexManagementHostAndPort=mongot:27028"]
     ports:
       - "27017:27017"
     volumes:
       - mongodb_data:/data/db
     healthcheck:
-      test: >
-        mongosh --quiet --eval
-        "try { rs.status().ok } catch (e) { rs.initiate().ok }"
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
       interval: 5s
       timeout: 5s
-      retries: 20
-
-  mongot:
-    # The mongot sidecar handles $search/$vectorSearch indexing and
-    # query execution; mongod stores the actual documents. They talk
-    # over the network — this container has no volume of its own for
-    # application data, only its own search-index state.
-    image: mongodb/mongodb-community-search:0.64.0
-    container_name: omnirag-mongot
-    depends_on:
-      mongodb:
-        condition: service_healthy
-    ports:
-      - "27028:27028"
-    volumes:
-      - mongot_data:/data
-    command: ["--mongodHostAndPort", "mongodb:27017"]
+      retries: 30
+      start_period: 20s
 
   neo4j:
     image: neo4j:4.4
@@ -97,11 +84,6 @@ services:
       - neo4j_data:/data
       - neo4j_logs:/logs
     healthcheck:
-      # Rule R-89 applies to the container level too, not just
-      # GET /health: a container that "looks up" before it can accept
-      # Bolt connections is exactly the race this healthcheck exists
-      # to close. cypher-shell ships in the neo4j:4.4 image itself, so
-      # no extra tooling is needed inside the container.
       test:
         [
           "CMD-SHELL",
@@ -133,7 +115,6 @@ services:
 
 volumes:
   mongodb_data:
-  mongot_data:
   neo4j_data:
   neo4j_logs:
   ollama_data:
