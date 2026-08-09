@@ -116,8 +116,6 @@ class TestMongoDBSingleton:
         # get_client() itself sidesteps that: every access to
         # mock_client.admin returns the *same* MagicMock, so its
         # .command is stable to patch.
-        from unittest.mock import MagicMock
-
         mock_client = MagicMock()
         mock_client.admin.command = AsyncMock(side_effect=OSError("connection refused"))
 
