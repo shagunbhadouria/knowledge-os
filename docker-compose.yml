@@ -43,28 +43,40 @@ services:
         condition: service_started
 
   mongodb:
-    # DECISION LOG UPDATE (post-Phase-3 local testing): the original
-    # two-container wiring (mongodb-community-server + a standalone
-    # mongodb-community-search sidecar, manually pointed at each other
-    # via --setParameter searchIndexManagementHostAndPort) is not the
-    # pattern MongoDB documents for local dev, and it never got an
-    # auth user configured between mongod and mongot. It failed at
-    # the mongot binary/startup stage before that gap even mattered.
-    # Replaced with mongodb/mongodb-atlas-local, MongoDB's own
-    # single-container image that bundles mongod + mongot + the
-    # runner process that wires them together — same $vectorSearch
-    # capability, no manual sync-source or credential wiring needed.
-    # This is a deviation from Blueprint 2.2/2.3's locked stack line
-    # ("MongoDB Atlas Vector Search... Community 8.2 local sidecar")
-    # — log this in the Blueprint Decision Register per Rule R-68.
-    image: mongodb/mongodb-atlas-local:latest
+    # DECISION LOG UPDATE (post-Phase-3 local testing, session 2):
+    # mongodb/mongodb-atlas-local was tried as a replacement for the
+    # original broken two-container mongod+mongot wiring (see prior
+    # note in git history). atlas-local consistently failed on this
+    # Windows 11 / Docker Desktop / WSL2 backend with:
+    #   "Read security file failed ... Error reading file
+    #   /data/configdb/keyfile: No such file or directory"
+    #   -> "Unable to acquire security key[s]" -> hard panic/exit(2).
+    # This reproduced identically across: fresh named volumes, no
+    # volumes at all, with/without a docker-entrypoint-initdb.d mount,
+    # and after a full `docker compose down -v` + volume prune. The
+    # image's internal runner never generates the keyfile it then
+    # tries to read, on this host. A similar unresolved report exists
+    # on MongoDB's own community forum (single mongodb_data:/data/db
+    # volume, restart loses the keyfile) but our failure happens on
+    # first boot too, which is a distinct/worse case.
+    # DECISION: dropped mongodb-atlas-local, reverted to plain `mongo`
+    # image for local dev. This drops Atlas Search / Atlas Vector
+    # Search locally, a real deviation from Blueprint 2.2/2.3's
+    # locked stack line ("MongoDB Atlas Vector Search... Community 8.2
+    # local sidecar"). Vector search capability is deferred: either
+    # revisit mongodb-atlas-local on a non-Windows host, or swap the
+    # retrieval layer's vector store per Blueprint 2.2's own rejected-
+    # alternatives list (e.g. Qdrant) if this recurs. Logged here per
+    # Rule R-68; see CHANGELOG.md and Blueprint 7.2/7.3 (DEBT-007).
+    image: mongo:7
     container_name: omnirag-mongodb
+    hostname: mongodb
     ports:
       - "27017:27017"
     volumes:
       - mongodb_data:/data/db
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      test: [ "CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok" ]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -84,11 +96,7 @@ services:
       - neo4j_data:/data
       - neo4j_logs:/logs
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "cypher-shell -u neo4j -p ${NEO4J_PASSWORD:-omnirag_password} 'RETURN 1' || exit 1",
-        ]
+      test: [ "CMD-SHELL", "cypher-shell -u neo4j -p ${NEO4J_PASSWORD:-omnirag_password} 'RETURN 1' || exit 1" ]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -98,9 +106,9 @@ services:
     image: redis:7
     container_name: omnirag-redis
     ports:
-      - "6379:6379"
+      - "6380:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 10

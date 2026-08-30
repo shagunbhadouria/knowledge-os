@@ -148,17 +148,19 @@ class TestNeo4jSchemaAgainstRealServer:
 
 
 class TestMongoVectorSearchIndexAgainstRealServer:
-    """Requires $vectorSearch support, provided locally by
-    docker-compose.yml's `mongodb-atlas-local` image (MongoDB's
-    official all-in-one local dev image, bundling mongod + mongot +
-    the connecting process - see the Decision Log for the earlier
-    community-server-plus-separate-mongot-sidecar setup this replaced,
-    and why). CI's integration-tests job runs a plain `mongo:7` service
-    container with no vector-search capability at all (GitHub Actions
-    `services:` cannot express an atlas-local-style bundled image the
-    way docker-compose can) - every test in this class is skipped
-    there and only runs locally via `make test-integration` against
-    the full docker-compose stack.
+    """Requires $vectorSearch support, provided by `mongodb-atlas-local`
+    (MongoDB's official all-in-one local dev image, bundling mongod +
+    mongot + the connecting process — see the Decision Log for the
+    earlier community-server-plus-separate-mongot-sidecar setup this
+    replaced, and why). Both docker-compose.yml locally and CI's
+    integration-tests job (.github/workflows/ci.yml) now run this same
+    image — the try/except skip below is defensive for any environment
+    where $vectorSearch genuinely isn't ready yet (e.g. mongot still
+    warming up), not a permanent CI-vs-local split. It previously *was*
+    a real split, when CI ran a plain `mongo:7` service container with
+    no vector-search capability at all; that stopped being true once CI
+    switched to `mongodb-atlas-local` too, and this docstring was left
+    describing the old, no-longer-accurate setup — corrected here.
     """
 
     async def test_ensure_vector_search_index_creates_and_is_idempotent(self) -> None:
@@ -176,3 +178,42 @@ class TestMongoVectorSearchIndexAgainstRealServer:
         indexes = await list_search_indexes()
         names = {idx.get("name") for idx in indexes}
         assert "embeddings_vector_index" in names
+
+
+class TestRedisStreamsAgainstRealServer:
+    """Real-service proof for app.database.redis.ensure_streams
+    (Blueprint Phase 3 deliverable: "Redis Streams consumer group
+    setup — XGROUP CREATE"; Phase 5 deliverable, same text, since
+    Phase 5's XREADGROUP consumer loop needs this same group to
+    already exist). The mocked unit tests in
+    app/database/test_database.py::TestEnsureStreams cannot prove the
+    actual XGROUP CREATE / BUSYGROUP protocol behaves correctly
+    against a real Redis server; this does. No equivalent test existed
+    for this function before — TestNeo4jSchemaAgainstRealServer and
+    TestMongoVectorSearchIndexAgainstRealServer above cover their
+    respective setup functions the same way; ensure_streams() was the
+    one Phase 3 setup function with no real-server integration test at
+    all."""
+
+    async def test_ensure_streams_creates_consumer_group_and_is_idempotent(
+        self,
+    ) -> None:
+        from app.database.redis import get_client
+        from app.shared.constants import (
+            INGESTION_CONSUMER_GROUP,
+            INGESTION_DEAD_LETTER_STREAM_NAME,
+            INGESTION_STREAM_NAME,
+        )
+
+        await redis.ensure_streams()
+        await redis.ensure_streams()  # must not raise (BUSYGROUP path)
+
+        client = get_client()
+        groups = await client.xinfo_groups(INGESTION_STREAM_NAME)
+        group_names = {g["name"] for g in groups}
+        assert INGESTION_CONSUMER_GROUP in group_names
+
+        # exists() on a stream key created via XADD+XTRIM(maxlen=0) —
+        # see ensure_streams()'s docstring for why that's how an empty
+        # stream gets created at all — still reports the key present.
+        assert await client.exists(INGESTION_DEAD_LETTER_STREAM_NAME)

@@ -187,6 +187,34 @@ class TestRunSeed:
         assert first_entity_idx < first_decision_idx
         assert first_entity_idx < first_source_idx
 
+    async def test_decisions_written_before_supersedes_links(self) -> None:
+        # _MERGE_SUPERSEDES MATCHes two Decision nodes by statement (the
+        # new one and the one it replaces) — same silent-failure risk as
+        # test_entities_written_before_decisions_and_sources above: if
+        # Decisions have not all been written yet when this query runs,
+        # MATCH finds nothing, no exception is raised, and the
+        # SUPERSEDES relationship this seed exists specifically to
+        # exercise (Blueprint 2.3's Decision-reversal pattern, and the
+        # whole reason a 3rd Decision node was added — see the
+        # DEVIATION NOTE in data.py) never gets created. Nothing
+        # previously asserted this ordering, only the equivalent
+        # Entity-before-Decision/Source ordering above.
+        driver = _mock_driver()
+        with patch.object(seed_run, "apply_schema", new=AsyncMock()):
+            await seed_run.run_seed(driver)
+
+        session = await driver.session.return_value.__aenter__()
+        issued_queries = [call.args[0] for call in session.run.await_args_list]
+
+        last_decision_idx = max(
+            i for i, q in enumerate(issued_queries) if q == seed_run._MERGE_DECISION
+        )
+        first_supersedes_idx = next(
+            i for i, q in enumerate(issued_queries) if q == seed_run._MERGE_SUPERSEDES
+        )
+
+        assert last_decision_idx < first_supersedes_idx
+
     async def test_causal_links_reference_seeded_decisions_and_concepts(
         self,
     ) -> None:

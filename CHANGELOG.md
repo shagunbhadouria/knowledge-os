@@ -1,5 +1,520 @@
 # Merge Log — knowledge-os-best-merged + knowledge-os-final → this build
 
+## mongodb-atlas-local abandoned for local dev — reverted to plain `mongo:7`
+
+Second architecture reversal on the MongoDB service this project has
+now made (see the atlas-local entry below for the first). Found this
+time through direct, live `docker compose up` testing on the actual
+target machine — Windows 11, Docker Desktop with the WSL2 backend —
+not through reading documentation or trusting a prior session's
+"verified" claim.
+
+**What failed.** `mongodb/mongodb-atlas-local:latest` consistently
+failed to start with:
+
+```
+{"c":"ACCESS","msg":"Read security file failed","attr":{"error":{
+  "code":30,"codeName":"InvalidPath",
+  "errmsg":"Error reading file /data/configdb/keyfile: No such file or directory"}}}
+{"c":"CONTROL","msg":"Error creating service context",
+  "attr":{"error":"Location5579201: Unable to acquire security key[s]"}}
+```
+followed by a hard panic (`error checking mongod: ... connection
+refused`) and container exit code 2. The container gets far enough to
+start mongod, run normal WiredTiger/thread-pool startup for several
+real seconds, then dies attempting to read a keyfile it never
+generated in the first place — this is not a slow-start race; watching
+`docker logs -f` live confirmed the read attempt happens well after
+mongod had time to write the file, had writing been attempted at all.
+
+**What was ruled out before concluding this is image/host-specific,
+not a config mistake:**
+- Missing `hostname: mongodb` — MongoDB's own docs list this as
+  *Required* for the bundled replica set to function. Added it;
+  progress was real (mongod's own log started correctly reporting
+  `"host":"mongodb"` and got further into startup) but the keyfile
+  failure was identical afterward.
+- Missing volumes — MongoDB's official reference `docker-compose.yml`
+  mounts `db:/data/db`, `configdb:/data/configdb`, and
+  `mongot:/data/mongot`; ours only had `/data/db`. Added all three
+  matching named volumes. No change in outcome.
+- Stale data from a prior run — confirmed via `docker volume inspect`
+  that a `mongodb_data` volume from 2026-08-01 existed and could
+  plausibly hold a mismatched keyfile from an earlier attempt. Removed
+  it and every related volume (`docker compose down -v` plus manual
+  `docker volume rm` on orphans), rebuilt from a verified-fresh empty
+  volume. Identical failure, first boot, on data that had never
+  existed before.
+- A known MongoDB community-forum report
+  (community/forums/t/mongodb-atlas-local-error-related-to-volumes-configured/301214)
+  describes the identical `errmsg` on the identical image, but only
+  after a restart cycle, with the explanation that `/data/configdb`
+  being ephemeral (not a named volume) means the keyfile generated on
+  first boot is lost on recreation. That does not match our case: ours
+  failed on a **first boot**, with `/data/configdb` correctly mounted
+  as a named, empty, freshly-created volume. This looks like a
+  different or more severe manifestation of the same underlying
+  keyfile-generation fragility in this image, and no fix for our exact
+  first-boot case was found publicly documented at time of writing.
+
+**Decision: dropped `mongodb-atlas-local`, reverted `mongodb` service
+to plain `mongo:7`.** This is a second, real deviation from Blueprint
+2.2/2.3's locked stack line ("MongoDB Atlas Vector Search... Community
+8.2 local sidecar") — first the two-container mongod+mongot wiring was
+dropped for atlas-local, now atlas-local itself is dropped. Plain
+`mongo:7` has no bundled `mongot`/Atlas Search process and therefore
+none of this keyfile machinery — it started healthy on the first try
+with zero special configuration.
+
+**Consequence, not a footnote: local MongoDB Atlas Vector Search
+capability is gone as of this change.** Any Phase 7 retrieval work
+planned against `MongoDB Atlas Vector Search` (Blueprint 2.2, 8.2) has
+no local backing store as currently configured. Options for later,
+none chosen yet: (a) retry `mongodb-atlas-local` on a non-Windows /
+non-WSL2 host to isolate whether this is a host-specific bug, (b) swap
+the vector store per Blueprint 2.2's own rejected-alternatives list
+(Qdrant was rejected only for adding "another Docker container,
+another connection" — a real but smaller cost than a non-functional
+vector store), (c) wait for a newer `mongodb-atlas-local` release and
+retest, since the image is new enough (per project notes, first
+encountered mid-2026) that this may be an unreported bug rather than a
+permanent limitation.
+
+**Also fixed in the same session, logged together since both were
+found via the same live-testing pass:**
+- `docker-compose.yml`'s `redis` service was hard-coded to publish
+  host port `6379:6379`. On this dev machine that collided with an
+  unrelated project's Redis container already bound to host 6379,
+  causing `docker compose up` to fail with "port is already
+  allocated." Remapped to `6380:6379` (container-internal port
+  unchanged; `REDIS_URL` env var — `redis://redis:6379/0` — is
+  correct as-is since it addresses the container's internal port over
+  the Docker network, not the host mapping). This is host-specific
+  and may not reproduce on a machine without a colliding service, but
+  the remap is harmless either way.
+- Confirmed and fixed a `docker-compose.yml` structural bug introduced
+  during this session's own editing (not present before tonight): the
+  mongodb service's volume mount list was briefly misplaced under
+  `ports:` instead of `volumes:` due to a miscounted line-index edit,
+  which produced an opaque `invalid proto:` error from `docker compose
+  config`/`up` with no line number or field name — traced to a known
+  Compose bug class (port-string validation running before the
+  YAML section boundary is respected on malformed structure). Fixed by
+  moving the volume mount back under the correct key. Worth noting for
+  future sessions: `invalid proto:` with no further detail from Compose
+  is not necessarily a URL/env-var problem — check for volume/port
+  section misplacement first, it's a one-line fix once found but very
+  hard to spot by reading the file normally since the YAML still looks
+  plausible at a glance.
+
+**Verified independently after all fixes** — `docker compose ps`
+showing all 5 containers `healthy`/`Up`, and a direct
+`curl http://localhost:3001/api/v1/health` returning the correct
+envelope (`mongodb`/`neo4j`/`redis`: `healthy`, `ollama`: `starting` —
+expected until Phase 5 wires up real Ollama calls) — not taken from a
+container status flag alone, since tonight's session also surfaced a
+case where `neo4j` briefly reported `unhealthy` due to the healthcheck
+window being shorter than APOC's one-time plugin-install startup cost
+on first boot, not any real fault; a `docker compose restart neo4j`
+against the now-initialized volume resolved that cleanly. Full
+Phase 2/3 test suite has not yet been re-run against this new
+`mongo:7` service — do not assume it passes until that happens.
+
+## R-16 cleanup + MONGODB_URI default drift, found by independent audit
+
+External audit (not self-reported — ruff/mypy/pytest run fresh in a
+clean venv, file lengths checked with `wc -l`, `.env.example` diffed
+against Blueprint 7.1's required-vars table) flagged two real gaps this
+CHANGELOG hadn't caught: two files over Rule R-16's 300-line limit, and
+`docker-compose.yml`'s `MONGODB_URI` default silently missing
+`replicaSet=rs0` while `.env.example`'s copy of the same default had
+it.
+
+**R-16 violations.** `app/test_health.py` had grown to 455 lines and
+`app/database/test_mongo_repository.py` to 351 — both flew under the
+radar because R-17 (tests live next to source) was satisfied and
+nobody re-checked R-16 against test files specifically after Phase 2/3
+accretion. Split by responsibility, not by line count alone:
+
+- `app/test_health.py` (455 → 66 lines) kept only the three tests that
+  actually exercise `GET /health`. The rest moved out:
+  - `app/test_route_stubs.py` — Phase 2's 18-endpoint 501-stub coverage
+    and the `_STUB_ENDPOINTS` table.
+  - `app/test_error_envelope.py` — the generic Rule R-28
+    envelope/error-handler seam tests (404/405 on unmatched routes,
+    request-id propagation, the `UnauthorizedError`/`TokenExpiredError`
+    401 seam tests for Phase 4 to build against). These never belonged
+    to "health" specifically; they test middleware every route shares.
+  - `app/test_graph_routes_phase3.py` — the Phase-3-made-real routes
+    (`/workspace/status`, `/graph/nodes`, `/graph/node/{id}`).
+  - `app/testing_support.py` — the shared `api_client()` ASGI-transport
+    helper all four files import. Named `testing_support.py`, not
+    `test_support.py`, specifically so pytest's `test_*.py` collection
+    pattern doesn't try to collect it and report zero tests found in
+    it.
+- `app/database/test_mongo_repository.py` (351 → 229 lines): its own
+  `TestVectorSearchIndex` class was testing `app/database/mongodb.py`
+  (`ensure_vector_search_index()`, `list_search_indexes()`), not
+  `mongo_repository.py`, despite the file's header docstring claiming
+  otherwise. Moved to `app/database/test_mongodb_vector_search.py`, a
+  correctly-labeled file. This was a mislabel this CHANGELOG never
+  caught, independent of the length rule.
+
+No test logic changed — same assertions, same mocks. Re-ran the full
+suite after the split: ruff clean, mypy strict clean on 87 source files
+(was 82 — new files, same code), 112 passed / 32 deselected on
+`pytest -m "not integration"`, identical to the pre-split count. Repo
+max file length is now 290 lines (`app/database/test_database.py`).
+
+**MONGODB_URI drift.** `.env.example` documented
+`mongodb://mongodb:27017/omnirag?replicaSet=rs0&directConnection=true`;
+`docker-compose.yml`'s inline fallback default
+(`${MONGODB_URI:-...}`) had the same string minus `replicaSet=rs0`.
+`directConnection=true` makes the driver skip topology discovery
+regardless, so this was very unlikely to cause an actual connection
+failure against `mongodb-atlas-local`'s internal single-node replica
+set — but two files documenting the "same" default while disagreeing
+is exactly the kind of unlogged drift that becomes a real bug later
+(e.g. if `directConnection=true` is ever removed without someone
+checking both files). Made the compose default match `.env.example`
+exactly.
+
+## Cross-phase audit: infra provisioning built but never invoked, plus one stale test docstring
+
+User asked for an integrated check across all 3 phases together,
+specifically for conflicts between them. Found a real one, distinct
+from anything a single-phase pass would surface: `ensure_streams()`
+(Redis consumer group + dead-letter stream) and
+`ensure_vector_search_index()` (MongoDB Atlas Vector Search index) —
+both fully built, tested, and previously reported "Done" in this
+CHANGELOG — were **never called by anything runnable**. Not the app's
+`_lifespan`, not `make seed`. Only `apply_schema()` (Neo4j) was
+actually wired in, via `make seed`. This is a real gap against
+Blueprint Phase 3's own deliverable text ("Redis connection confirmed
+with PING. Streams and pub/sub channels configured" /
+"MongoDB Atlas Vector Search index active") — provable statically
+(grep for callers), not something needing Docker to confirm. Earlier
+CHANGELOG entries reporting these functions "Done" were accurate about
+the function's own correctness, not about whether anything actually
+invokes it in a real environment; that distinction wasn't called out
+before, so a later reader could reasonably assume "Done" meant "wired
+in" too. Correcting that going forward.
+
+**Root cause, once found, was smaller than it first looked:** a
+`make migrate` target already existed in the Makefile, already
+correctly separated from `make seed`'s demo-data concern (a senior
+review of the two options — bundle setup into `make seed`, vs. use the
+already-separate `make migrate` — favored keeping them apart, since
+staging/prod runs migrations but never runs demo seeding, so bundling
+them would make it impossible to provision real infra without also
+loading fake data). `make migrate` was just missing `ensure_streams()`
+and, more importantly, was never referenced by anything — not README,
+not CI, not docker-compose.yml — so nothing actually told a developer
+or CI to run it.
+
+**Fixes:**
+- `Makefile`: `migrate` target now also calls `ensure_streams()`,
+  alongside the `apply_schema()` and `ensure_vector_search_index()`
+  it already called.
+- `.github/workflows/ci.yml`: `integration-tests` job now runs the
+  same three-function provisioning step after services report healthy
+  and before `pytest -m integration` runs, so integration tests
+  actually exercise provisioned infra by design instead of by
+  incidental luck (see below).
+- `README.md`: documented `make migrate` as a required first-time
+  setup step, run once after `make dev`, before `make seed`. Also
+  corrected an unrelated but adjacent stale line in the same section —
+  "`make seed` is reserved for Phase 3 and currently fails
+  intentionally until the database seed script exists" — which
+  stopped being true once Phase 3 was completed several commits ago
+  and was never updated.
+- `tests/test_phase3_integration_infra.py`: added
+  `TestRedisStreamsAgainstRealServer`, the one Phase 3 setup function
+  (`ensure_streams()`) with no real-server integration test at all —
+  `apply_schema()` and `ensure_vector_search_index()` both already had
+  one, each self-contained (calls the function on itself before
+  asserting, not dependent on test file/class ordering — verified by
+  reading each class, not assumed). Also corrected
+  `TestMongoVectorSearchIndexAgainstRealServer`'s docstring, which
+  claimed CI runs a plain `mongo:7` service container with no
+  vector-search capability — true at some earlier point, no longer
+  true since `.github/workflows/ci.yml` was confirmed to run
+  `mongodb/mongodb-atlas-local:latest`, identical to
+  docker-compose.yml, not `mongo:7`.
+
+**Verified:** `xinfo_groups()`'s return shape (list of dicts with a
+`"name"` key) confirmed against redis-py documentation/examples before
+writing assertions against it — could not run this new test against a
+real Redis in this sandbox, so getting the assumed API shape right
+mattered more than usual. `mypy`/`ruff check`/`ruff format --check` on
+the modified test file: clean. Pytest collection: the new test
+collects correctly (11 tests in the file, up from 10; 32 integration
+tests total repo-wide, up from 31). `.github/workflows/ci.yml`
+re-parsed with PyYAML after editing to confirm the new step is valid
+YAML in the right position (after "Wait for service containers",
+before "Pytest (integration)"). Full non-integration suite unaffected:
+112 passed, 0 failed. `pre-commit run --all-files`: still 4/4 passing.
+
+## Phase 3 audit — missing test coverage for SUPERSEDES write-ordering found and fixed
+
+User asked for a Phase 3 re-check with the same rigor as the Phase 1/2
+passes: verify Cypher syntax against the pinned Neo4j 4.4 manual
+specifically (not just "current" docs), verify the injection defenses
+in `app/graph/repository.py` with a real payload rather than trust the
+code comments, and field-by-field diff every seeded node's properties
+against Blueprint 2.3 rather than just check counts.
+
+**Verified, no defect (worth recording since these were genuine open
+questions, not assumptions):**
+- `schema.py`'s `CREATE FULLTEXT INDEX ... IF NOT EXISTS FOR (n:Label)
+  ON EACH [...]`, `CREATE INDEX ... IF NOT EXISTS FOR (n:Label) ON
+  (n.prop)`, and `CREATE CONSTRAINT ... REQUIRE n.prop IS UNIQUE` all
+  checked directly against `neo4j.com/docs/cypher-manual/4.4/` (the
+  exact pinned server version, not "current") — all three forms are
+  correct, valid 4.4 syntax, character-for-character.
+- `app/graph/repository.py`'s label/key_property interpolation (the
+  one place in the whole codebase where an identifier, not a value,
+  is put into an f-string Cypher query — necessary because Cypher has
+  no parameter syntax for labels/property names): tested live with an
+  actual injection payload (`key_property="name}) DETACH DELETE n
+  //"`) — correctly rejected with `ValueError` before reaching Neo4j.
+  Also tested the same attack at the HTTP boundary via `GET
+  /graph/nodes?type=...DETACH DELETE...` — correctly rejected with
+  `400 VALIDATION_ERROR` by Pydantic's closed `Literal[NodeLabel]`
+  before the request handler even runs. Both layers are real, not
+  just documented.
+- All 4 seeded node types' properties (Concept, Entity, Decision,
+  Source) diffed field-by-field against Blueprint 2.3's node tables,
+  programmatically, not spot-checked — zero drift in either direction
+  on any of the 4 labels.
+- `app/entity_resolution/repository.py` has zero f-string Cypher
+  interpolation (fully parameterized throughout) — a prior session's
+  notes claimed a specific injection-rejection test existed in this
+  module; that claim was checked and found incorrect (no such test
+  exists, nor is one needed, since there's no identifier-interpolation
+  surface here to test in the first place). Correcting the record
+  rather than repeating the inaccurate claim.
+- The dead-letter-stream creation pattern in `app/database/redis.py`
+  (`XADD` then `XTRIM ... MAXLEN 0` to leave an empty-but-existing
+  stream) confirmed against Redis's own documentation as the correct,
+  intended technique for this — not an invented workaround.
+
+**Defect found and fixed:** `app/database/seeds/test_seeds.py` tested
+that Entities are written before Decisions/Sources (both MATCH an
+Entity by name — writing them out of order means the MATCH silently
+finds nothing, no exception, and the relationship is just never
+created), but nothing tested the equivalent ordering requirement for
+`_MERGE_SUPERSEDES`, which MATCHes two Decision nodes by statement and
+has the exact same silent-failure risk. The actual code in `run.py`
+has always had the correct order (Decisions written on line 145,
+SUPERSEDES on line 158) — this was a test-coverage gap, not a live
+bug, but it meant a future refactor could silently break the one
+relationship this seed's 3rd Decision node exists specifically to
+exercise (the temporal-reversal pattern, Blueprint 2.3's most
+important design decision per its own text), and nothing would catch
+it.
+
+**Fix:** added `test_decisions_written_before_supersedes_links`,
+matching the existing ordering test's exact style and reasoning.
+**Verified per Rule R-66** ("AI-generated tests must actually fail
+when the code is wrong"): deliberately moved the SUPERSEDES-writing
+loop before the Decision-writing loop in `run.py`, reran the new test
+alone, confirmed it failed with a precise assertion (`9 < 6`), then
+reverted `run.py` to its original (correct) state via `git diff`
+showing zero changes to that file. Full suite after the revert: 17/17
+passed in `test_seeds.py`, 112/112 passed repo-wide (up from 111 —
+the one new test), `mypy`/`ruff` clean on the modified file,
+`pre-commit run --all-files` still 4/4 passing.
+
+User asked for Phase 1 to be re-checked from scratch after a prior pass
+had only verified `mypy app`, `ruff check`, and `ruff format --check`
+directly (i.e. the same commands CI runs) — never `pre-commit run
+--all-files` itself, which is the actual Phase 1 deliverable ("Pre-commit
+hooks — Ruff lint, mypy strict compile, no-secrets scanner"). Running the
+real hooks surfaced two defects invisible to every prior check:
+
+**Defect 1 — `.pre-commit-config.yaml`'s mypy hook was missing almost
+every runtime dependency.** `additional_dependencies` listed only
+`pydantic==2.10.4` and `pydantic-settings==2.7.1` — no `fastapi`,
+`starlette`, `neo4j`, `motor`, `redis`, `structlog`, or
+`python-multipart`. Pre-commit's mypy hook runs mypy inside its own
+isolated virtualenv containing only what's listed there — it does not
+inherit `requirements.txt`/`requirements-dev.txt` the way CI's `mypy
+app` step does (CI runs `pip install -r requirements-dev.txt` first,
+which pulls in `requirements.txt` too, giving mypy real types for
+every dependency). Because of this, `pre-commit run --all-files`
+reported **62 mypy errors across 14 files** — every FastAPI route
+decorator flagged as "Untyped decorator" (FastAPI's own decorator
+typing wasn't visible without the `fastapi` package present), plus
+attribute-not-found errors on Motor/redis calls. None of these errors
+are real; CI's `mypy app` (full deps) has always passed clean, and
+still does. But a developer running the hook as intended — before
+committing, per the whole point of pre-commit — would see a wall of
+alarming failures unrelated to whatever they'd actually changed. That
+either trains people to `git commit --no-verify` past a hook that's
+correctly catching real issues elsewhere, or wastes time chasing
+phantom errors.
+
+**Fix:** `additional_dependencies` now lists the exact same pins as
+`requirements.txt`, plus `pytest`/`pytest-asyncio` (needed because
+mypy's `packages = ["app"]` scope in `pyproject.toml` includes
+`app/test_health.py` and `app/database/test_database.py`, which use
+`pytest.mark.asyncio` — CI has these via `requirements-dev.txt`, so
+the hook needs them too for parity). Re-running `pre-commit run mypy
+--all-files` after the fix: **0 errors** (down from 62).
+
+**Defect 2 — `.secrets.baseline` was stale**, never updated after
+`.github/workflows/ci.yml` was added/modified. That workflow sets
+`NEO4J_PASSWORD: test-password` as a plain env var for the ephemeral
+Neo4j service container GitHub Actions spins up for integration tests
+— a fake, non-sensitive value, not a real credential. detect-secrets'
+"Secret Keyword" plugin correctly flags any `*_PASSWORD:` assignment
+regardless of the value, which is the intended behavior; a human is
+supposed to confirm each flagged line is a false positive and record
+that in the baseline. That confirmation had never happened for this
+file, so `pre-commit run --all-files` failed with "Potential secrets
+about to be committed" on every run.
+
+**Fix:** verified the flagged value directly — `sha1sum` of the
+literal string `test-password` matches the hash detect-secrets
+recorded byte-for-byte, confirming the baseline entry corresponds to
+exactly this known-fake value and not some other secret coincidentally
+sharing a line number. Regenerated `.secrets.baseline` via
+`detect-secrets scan --baseline .secrets.baseline` (never hand-edited —
+the file's hashes/line-numbers must come from the tool itself).
+Re-running `pre-commit run detect-secrets --all-files`: **passed**.
+
+**Verified this pass:** `pre-commit run --all-files` — **all 4 hooks
+pass** (ruff, ruff-format, mypy, detect-secrets), for what appears to
+be the first time in this project's history; nothing in prior sessions'
+notes recorded ever having run the hooks directly rather than the
+underlying commands. Whole-repo `mypy app` (CI's actual command, full
+deps): still clean, 82 files, unaffected by this fix since CI was
+never the broken path. `pytest -m "not integration"`: still 111
+passed, 0 failed, unaffected.
+
+## Stale corpus-size caveat in benchmark_neo4j.py
+
+`app/scripts/benchmark_neo4j.py`'s corpus-size print statement was
+hardcoded as "3 Concepts, 3 Entities, **2** Decisions, 5 Sources" —
+stale since an earlier session's disclosed deviation added a third
+Decision node to `app/database/seeds/data.py` (see the "3 Decision
+nodes, not 2" entry further below). Fixed to import `CONCEPTS`,
+`ENTITIES`, `DECISIONS`, `SOURCES` from `app.database.seeds.data` and
+print `len()` of each directly, so the Journal 5.1 latency-baseline
+output can no longer drift out of sync with the actual seed data —
+whoever pastes this script's output into the Engineering Journal now
+gets the true corpus size automatically, not a number someone typed
+once and forgot to update.
+
+**Verified:** `mypy app/scripts/benchmark_neo4j.py --strict` clean.
+`ruff check` / `ruff format --check` clean. Confirmed the module
+imports without error and the new print statement outputs "3
+Concepts, 3 Entities, 3 Decisions, 5 Sources" — matching
+`len(CONCEPTS)==3, len(ENTITIES)==3, len(DECISIONS)==3,
+len(SOURCES)==5` read directly from `data.py`. Did not run the actual
+benchmark queries — no live Neo4j in this sandbox; the fix is to the
+static print statement, not to the query-timing logic, which was
+already correct.
+
+## Full-repo Phase 1–3 re-audit — 1 real bug found and fixed (previously known, unresolved)
+
+Whole-repo `ruff check`, `ruff format --check`, `mypy app` (strict),
+`pip-audit` (both requirement files), and `pytest -m "not integration"`
+all run fresh, not re-asserted from a prior session's notes.
+
+**Bug (regression from the `create_collection()` fix in Phase 3):**
+`app/database/test_mongo_repository.py::TestVectorSearchIndex` had 3
+tests failing — not against a live MongoDB (correctly absent per this
+file's own header: "Mocked Motor collection objects — no real MongoDB
+in Stage 1 CI"), but with `pymongo.errors.ServerSelectionTimeoutError`
+after a 30s connect timeout, meaning they were genuinely reaching the
+network. Root cause: `mongodb.ensure_vector_search_index()` calls
+`get_database().create_collection("embeddings")` *before* it calls
+`get_embeddings_collection()` (needed because `create_search_index()`
+requires the collection to exist server-side first, and a fresh
+database genuinely doesn't have it yet — see that function's own
+docstring). These 3 tests mocked only `get_embeddings_collection()`,
+so `get_database()` fell through to a real Motor client on every run.
+
+**Fix:** added `get_database()` mocking (via a shared `_mock_database()`
+helper) to all 3 existing tests, and added a 4th
+(`test_swallows_collection_already_exists_error`) covering the
+`create_collection`-level `CollectionInvalid` idempotency guard, which
+none of the original 3 exercised — only the search-index-level
+`OperationFailure` guard was covered before.
+
+**Verified:** all 4 tests in `TestVectorSearchIndex` now run in
+**0.25s** (down from ~90-120s of network timeout waiting) —
+confirms they're now genuinely isolated unit tests, not just passing
+by luck. Full non-integration suite: **111 passed, 0 failed** (up
+from 107 passed / 3 failed), 31.14s total (down from 122.9s). Whole-repo
+`mypy app --strict`: clean, 82 files. Whole-repo `ruff check` /
+`ruff format --check`: clean, 88 files. `pip-audit` on both requirement
+files: no known vulnerabilities.
+
+## Phase 2 exit-criteria audit — 2 gaps found, both closed
+
+User asked for a line-by-line Phase 2 (Backend Skeleton) audit against
+Blueprint 2.4/3.1 and Rules v4, independent of Phase 3's already-verified
+state. Found two real gaps; both fixed this pass, verified live rather
+than by reading code.
+
+**Gap 1 — undisclosed deviation (Rule R-68 violation).** `GET
+/api/v1/health` (`app/shared/health.py`) deliberately does **not**
+wrap its response in the standard envelope (`{success, data, error,
+meta}`) — it returns `{status, services}` directly, so uptime monitors
+and load balancers can parse it without envelope-awareness. That is a
+reasonable call, and it was explained in a code comment at the point of
+decision — but Rule R-28 states the envelope applies "no exceptions,"
+and Blueprint 2.4 lists `/health` in the same endpoint table as the
+other 17, with no stated exception. A code comment is not the decision
+log; per R-68/R-76 every blueprint deviation belongs here the same
+session it's made. This entry is that log entry, written after the
+fact for a deviation that predates it — logging it now rather than
+leaving it silent.
+- **Decision:** keep `/health` unwrapped.
+- **Reason:** infra convention (unversioned or minimally-shaped health
+  endpoints for probes) outweighs strict envelope consistency for this
+  one endpoint; wrapping it would make every existing and future
+  uptime-monitor / container-orchestrator health probe need
+  envelope-aware parsing for no operational benefit.
+- **Scope:** `/api/v1/health` only. No other endpoint deviates from
+  the standard envelope.
+
+**Gap 2 — Phase 2 exit criterion "Invalid JWT returns 401
+UNAUTHORIZED — never 500" had no test proving it, and no code path
+exercises it yet.** Real JWT validation (reading the `Authorization`
+header, verifying the token) is explicitly a Phase 4 deliverable
+("JWT middleware on all protected routes") per Blueprint Phase 4 —
+Phase 2's own deliverables list never mentions JWT. Building real
+token verification now would front-run Phase 4's actual work
+(Authlib, RS256 keys, Redis-backed refresh tokens) and risk having to
+redo it. What Phase 2 *does* own, per its deliverables list, is the
+error-handler middleware (`install_error_handlers`, Rule R-28) — the
+piece that turns any raised error into the correct envelope+status.
+**Resolution:** scoped the fix to what Phase 2 controls. Added
+`test_unauthorized_error_returns_401_not_500` and
+`test_token_expired_error_returns_401_not_500` to
+`app/test_health.py`, each mounting a throwaway route that raises
+`UnauthorizedError` / `TokenExpiredError` directly against the same
+`install_error_handlers()` wiring `create_app()` uses, and asserting
+401 with the correct `error.code`. This proves the seam Phase 2 is
+responsible for — when Phase 4 wires real JWT middleware and raises
+these same exception classes, the error handler already turns them
+into 401, never 500, with zero changes needed on the Phase 4 side.
+No JWT-checking production code was added; `UnauthorizedError` and
+`TokenExpiredError` already existed in `app/shared/errors.py`
+unused by any route.
+
+**Verified this pass:** `pytest app/test_health.py -m "not
+integration"` — **31 passed** (29 pre-existing + 2 new), 0 failed.
+`mypy app/test_health.py --strict` — clean. `ruff check` / `ruff
+format --check` on the modified file — clean. Did not re-run the
+Phase 3+ integration suite or whole-repo mypy/ruff — out of scope for
+a Phase 2-only audit; scoping this way avoids misattributing any
+Phase 3+ issue to Phase 2's exit criteria.
+
 ## Final Blueprint Deliverable + Exit Criteria line-by-line pass
 
 User asked, after the §3.1–3.3 sweep and the healthcheck reconciliation,
@@ -898,3 +1413,15 @@ entry.
   still never provided to paste this into directly — the numbers
   exist and are verified; the act of writing them into that specific
   document is the user's remaining step, not a blocked one.
+
+## Addendum: mongodb-atlas-local confirmed NOT host-broken — isolated single-container test passes healthy
+
+Follow-up to the "mongodb-atlas-local abandoned for local dev" entry immediately below. That entry concluded the image was unreliable on this specific host (Windows 11 / Docker Desktop / WSL2) after three separate fix attempts inside our `docker-compose.yml` all reproduced the identical keyfile failure. That conclusion was too broad and is now corrected.
+
+**Test performed:** ran the image standalone, with none of our compose file's configuration, exactly matching MongoDB's own bare quickstart:
+
+No `hostname:`, no named volumes, no `depends_on`, no other services on the same Docker network. Result: `Up 10 minutes (healthy)`, confirmed via `docker ps` and `docker logs`, with no keyfile error at any point. The image itself is not broken on this host.
+
+**Revised conclusion:** the keyfile failure was triggered by something specific to our `docker-compose.yml` configuration — most likely candidate is the custom `hostname: mongodb` directive we added per MongoDB's own "Required" guidance (never tested in isolation on its own, only ever stacked together with volumes, `depends_on` health-condition chains, and other services on the same network), though this was not conclusively isolated before the session ended. Other candidates not yet ruled out: interaction with the `depends_on: condition: service_healthy` graph from other services, or the specific combination of all four documented-required volumes together rather than individually.
+
+**Updated next step for DEBT-007 (see Blueprint 7.3):** before retrying `mongodb-atlas-local` on a different host, first retry it *inside* `docker-compose.yml` but changed one variable at a time against this now-confirmed-working baseline — starting with removing `hostname: mongodb` and re-testing, since that is the most-suspected untested variable. If compose-level integration succeeds with that removed, the `mongo:7` reversion in this build was avoidable and should be revisited. `mongo:7` remains the working local default until this is retested — do not switch back without re-running the full integration suite (`pytest -m integration`, expect 31 passed / 1 skipped) against whatever configuration is tried.

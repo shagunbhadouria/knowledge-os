@@ -19,8 +19,8 @@ seed:
 
 migrate:
 	docker compose run --rm omnirag-api python -c \
-		"import asyncio; from app.database.schema import apply_schema; from app.database.mongodb import ensure_vector_search_index; \
-asyncio.run(apply_schema()); asyncio.run(ensure_vector_search_index())"
+		"import asyncio; from app.database.schema import apply_schema; from app.database.mongodb import ensure_vector_search_index; from app.database.redis import ensure_streams; \
+asyncio.run(apply_schema()); asyncio.run(ensure_vector_search_index()); asyncio.run(ensure_streams())"
 
 build:
 	docker build --target production -t omnirag-api:latest .

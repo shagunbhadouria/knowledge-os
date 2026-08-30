@@ -119,6 +119,33 @@ jobs:
           until (echo > /dev/tcp/localhost/7687) 2>/dev/null; do sleep 1; done
           until (echo > /dev/tcp/localhost/6379) 2>/dev/null; do sleep 1; done
 
+      # Provisions the same infra `make migrate` provisions locally
+      # (Neo4j schema/indexes, Mongo Atlas Vector Search index, Redis
+      # Streams consumer group + dead-letter stream) before any test
+      # runs against these fresh service containers. Without this,
+      # `pytest -m integration` was passing only because each affected
+      # test class happened to call apply_schema()/
+      # ensure_vector_search_index() on itself first -- true for
+      # those two, but there was no equivalent integration test (and
+      # therefore no equivalent self-provisioning) for ensure_streams()
+      # at all. This step makes the guarantee explicit and complete
+      # instead of incidental.
+      - name: Provision infra (schema, vector index, streams)
+        run: |
+          python -c "
+          import asyncio
+          from app.database.schema import apply_schema
+          from app.database.mongodb import ensure_vector_search_index
+          from app.database.redis import ensure_streams
+
+          async def main() -> None:
+              await apply_schema()
+              await ensure_vector_search_index()
+              await ensure_streams()
+
+          asyncio.run(main())
+          "
+
       - name: Pytest (integration)
         run: pytest -m integration
 

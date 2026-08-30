@@ -82,11 +82,28 @@ Expected Phase 2 response:
 
 ```bash
 make dev
+make migrate
+make seed
 make test
 make lint
-make seed
 make build
 make pull-models
 ```
 
-`make seed` is reserved for Phase 3 and currently fails intentionally until the database seed script exists.
+**First-time setup, in order:** `make dev` starts the 5 Docker Compose
+services. Once they're healthy, run `make migrate` once — this
+provisions infrastructure that must exist before the app or any
+ingestion worker can do real work: Neo4j schema constraints and
+indexes, the MongoDB Atlas Vector Search index, and the Redis Streams
+consumer group + dead-letter stream (Blueprint Phase 3 deliverables).
+It's idempotent — safe to rerun, e.g. after pulling a fresh image —
+but only needs to run once per fresh environment, not on every
+`docker compose up`. `make seed` (optional, local/dev only — never run
+in staging or production) then loads the fixed demo dataset described
+above.
+
+Both commands were previously undocumented here even though `make
+migrate` already existed in the Makefile — this section used to say
+"`make seed` is reserved for Phase 3 and currently fails intentionally
+until the database seed script exists," which stopped being true once
+Phase 3 was completed; corrected.

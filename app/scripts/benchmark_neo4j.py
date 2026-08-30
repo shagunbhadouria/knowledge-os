@@ -21,12 +21,11 @@ Run inside the omnirag-api container, against the real seeded corpus:
     docker compose exec omnirag-api python scripts/benchmark_neo4j.py
 
 Honest caveat this script prints in its own output: the seeded corpus
-is tiny (3 Concepts, 3 Entities, 2 Decisions, 5 Sources) so these
-numbers will run faster than a populated production graph would.
-Log that caveat in the Journal entry alongside the numbers — a fast
-baseline on 13 nodes is not evidence the p95 < 200ms target holds at
-production scale, only that the measurement approach and index wiring
-are correct today.
+is tiny, so these numbers will run faster than a populated production
+graph would. Log that caveat in the Journal entry alongside the
+numbers — a fast baseline on a handful of nodes is not evidence the
+p95 < 200ms target holds at production scale, only that the
+measurement approach and index wiring are correct today.
 """
 
 from __future__ import annotations
@@ -39,6 +38,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.database.neo4j import get_driver
+from app.database.seeds.data import CONCEPTS, DECISIONS, ENTITIES, SOURCES
 from neo4j import AsyncSession
 
 RUNS = 50
@@ -84,9 +84,11 @@ async def main() -> None:
     print(f"Benchmark started: {datetime.now(UTC).isoformat()}")
     print(f"Runs per query: {RUNS}")
     print(
-        "Corpus size at measurement time: 3 Concepts, 3 Entities, "
-        "2 Decisions, 5 Sources (Phase 3 seed data — small, see "
-        "module docstring caveat)."
+        f"Corpus size at measurement time: {len(CONCEPTS)} Concepts, "
+        f"{len(ENTITIES)} Entities, {len(DECISIONS)} Decisions, "
+        f"{len(SOURCES)} Sources (Phase 3 seed data, read live from "
+        "app/database/seeds/data.py — small, see module docstring "
+        "caveat)."
     )
 
     fulltext_durations = await _time_query(

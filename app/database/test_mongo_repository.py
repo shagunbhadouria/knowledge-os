@@ -4,18 +4,26 @@ Mocked Motor collection objects — no real MongoDB in Stage 1 CI. The
 real-service proof is tests/test_phase3_integration_repositories.py's
 tests plus manual verification via `make seed` / Atlas dashboard for
 the collections this module writes to.
+
+Split during the Phase 3 R-16 cleanup (Rule R-16: no file longer than
+300 lines) — see CHANGELOG. The former TestVectorSearchIndex class
+moved to app/database/test_mongodb_vector_search.py: it tests
+app/database/mongodb.py's ensure_vector_search_index()/
+list_search_indexes(), not this module, so its old home here was a
+mislabel as well as a length problem — this file's own header always
+said "Tests for app/database/mongo_repository.py" while a third of its
+tests exercised a different module entirely.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from bson import ObjectId
 
 from app.database import mongo_repository
-from app.shared.constants import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL_NAME
+from app.shared.constants import EMBEDDING_MODEL_NAME
 
 
 class TestRawEvents:
@@ -219,80 +227,3 @@ class TestGeneratedDocuments:
             await mongo_repository.list_generated_documents()
 
         collection.find.assert_called_once_with({})
-
-
-class TestVectorSearchIndex:
-    async def test_creates_index_with_384_dimensions_and_cosine_similarity(
-        self,
-    ) -> None:
-        from app.database import mongodb
-
-        collection = MagicMock()
-        collection.create_search_index = AsyncMock()
-
-        with patch.object(
-            mongodb, "get_embeddings_collection", return_value=collection
-        ):
-            await mongodb.ensure_vector_search_index()
-
-        collection.create_search_index.assert_awaited_once()
-        assert collection.create_search_index.await_args is not None
-        model = collection.create_search_index.await_args.kwargs["model"]
-        assert model.document["name"] == "embeddings_vector_index"
-        assert model.document["type"] == "vectorSearch"
-        fields = model.document["definition"]["fields"]
-        assert fields[0]["numDimensions"] == EMBEDDING_DIMENSIONS
-        assert fields[0]["similarity"] == "cosine"
-        assert fields[0]["path"] == "embedding"
-
-    async def test_swallows_already_exists_error(self) -> None:
-        from pymongo.errors import OperationFailure
-
-        from app.database import mongodb
-
-        collection = MagicMock()
-        collection.create_search_index = AsyncMock(
-            side_effect=OperationFailure("Index already exists")
-        )
-
-        with patch.object(
-            mongodb, "get_embeddings_collection", return_value=collection
-        ):
-            # Must not raise.
-            await mongodb.ensure_vector_search_index()
-
-    async def test_reraises_unrelated_operation_failures(self) -> None:
-        from pymongo.errors import OperationFailure
-
-        from app.database import mongodb
-
-        collection = MagicMock()
-        collection.create_search_index = AsyncMock(
-            side_effect=OperationFailure("Some other server error")
-        )
-
-        with patch.object(
-            mongodb, "get_embeddings_collection", return_value=collection
-        ):
-            try:
-                await mongodb.ensure_vector_search_index()
-                raise AssertionError("expected OperationFailure to propagate")
-            except OperationFailure:
-                pass
-
-    async def test_list_search_indexes_returns_index_documents(self) -> None:
-        from app.database import mongodb
-
-        async def _fake_cursor() -> Any:
-            for doc in [{"name": "embeddings_vector_index"}]:
-                yield doc
-
-        collection = MagicMock()
-        collection.list_search_indexes = MagicMock(return_value=_fake_cursor())
-
-        with patch.object(
-            mongodb, "get_embeddings_collection", return_value=collection
-        ):
-            indexes = await mongodb.list_search_indexes()
-
-        assert indexes == [{"name": "embeddings_vector_index"}]

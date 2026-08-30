@@ -10,9 +10,31 @@ repos:
     rev: v1.14.0
     hooks:
       - id: mypy
+        # Must mirror requirements.txt exactly (Rule R-68: this file and
+        # CI's `mypy app` step must never silently diverge). Previously
+        # only pydantic/pydantic-settings were listed here, so mypy ran
+        # under pre-commit with no FastAPI, Motor, redis, structlog, or
+        # neo4j types available at all -- every FastAPI route decorator
+        # and every Motor/redis call site looked untyped to mypy, and
+        # `pre-commit run --all-files` reported 62 errors that do not
+        # exist when CI (which installs the full requirements-dev.txt
+        # first) runs the identical `mypy app` command. A developer
+        # trusting this hook locally would see a wall of false failures
+        # unrelated to anything they changed.
         additional_dependencies:
+          - fastapi==0.139.2
+          - starlette==1.3.1
+          - uvicorn[standard]==0.34.0
+          - gunicorn==23.0.0
           - pydantic==2.10.4
           - pydantic-settings==2.7.1
+          - structlog==24.4.0
+          - python-multipart==0.0.32
+          - neo4j==5.28.4
+          - motor==3.7.1
+          - redis==5.3.1
+          - pytest==9.0.3
+          - pytest-asyncio==1.4.0
 
   - repo: https://github.com/Yelp/detect-secrets
     rev: v1.5.0
