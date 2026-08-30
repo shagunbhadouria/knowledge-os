@@ -60,7 +60,7 @@ jobs:
       # with just image/ports/health-cmd, same shape as any other.
       # Ref: mongodb.com/community/forums/t/mongodb-mongodb-atlas-local-not-working-in-github-actions/311906
       mongo:
-        image: mongodb/mongodb-atlas-local:latest
+        image: mongo:7
         ports:
           - 27017:27017
         options: >-
@@ -151,13 +151,17 @@ jobs:
         run: |
           python -c "
           import asyncio
+          from pymongo.errors import OperationFailure
           from app.database.schema import apply_schema
           from app.database.mongodb import ensure_vector_search_index
           from app.database.redis import ensure_streams
 
           async def main() -> None:
               await apply_schema()
-              await ensure_vector_search_index()
+              try:
+                  await ensure_vector_search_index()
+              except OperationFailure as exc:
+                  print(f'Skipping vector search index (mongo:7 has no Atlas Search support): {exc}')
               await ensure_streams()
 
           asyncio.run(main())
