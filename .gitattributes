@@ -1,0 +1,15 @@
+# Force LF line endings for all text files, regardless of local
+# git config (core.autocrlf) or OS. This project's CI, pre-commit
+# hooks, and prior CRLF-contamination fixes (see CHANGELOG.md) all
+# assume LF. Without this file, a Windows dev machine with
+# core.autocrlf=true will silently rewrite every staged file to
+# CRLF, reintroducing the exact bug already fixed once.
+* text=auto eol=lf
+
+# Never touch line endings in binary-ish or generated files.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
