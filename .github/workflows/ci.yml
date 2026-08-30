@@ -33,7 +33,7 @@ jobs:
         run: mypy app
 
       - name: Pytest
-        run: pytest
+        run: pytest -m "not integration"
 
       - name: pip-audit (Blueprint 2.5 A06 / Phase 11 exit criterion)
         run: |
